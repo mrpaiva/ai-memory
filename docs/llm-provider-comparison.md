@@ -2,22 +2,31 @@
 
 > **TL;DR.** ai-memory's consolidation prompt had a latent
 > schema-vs-prompt bug that made every provider fail JSON validation.
-> Two rounds of fixes (schema + prompt) yielded these
-> 5-fixture results:
+> After two rounds of fixes (schema + tightened anti-hallucination
+> prompt), six providers were benchmarked on the same 5 fixtures:
 >
-> | Provider | Parse | Avg latency | Faithfulness | Cost/run |
-> |---|---|---|---|---|
-> | **Haiku 4.5** (OpenRouter) | 5/5 | **7.3 s** | high | low |
-> | Sonnet 4.5 (OpenRouter) | 5/5 | 10.8 s | high (after prompt fix) | ~3× Haiku |
-> | qwen3:32b (Ollama local) | 5/5 | 92 s | high | **$0** |
-> | Kimi-K2.6 (OpenRouter) | hangs | n/a | n/a | ineligible (reasoning model) |
+> | Provider | Parse | Avg latency | Faithfulness | $/M out tokens† | Notes |
+> |---|---|---|---|---|---|
+> | qwen3:32b (Ollama local) | 5/5 | 92 s | high | **$0** | production default |
+> | **GPT-5.4-mini** (OpenRouter) | 5/5 | **4.3 s** | high‡ | ~$1 | fastest + cheapest hosted |
+> | Haiku 4.5 (OpenRouter) | 5/5 | 7.3 s | high | ~$5 | most disciplined hosted on restraint |
+> | DeepSeek V4 Flash (OpenRouter) | 5/5 | 21.7 s | high | ~$0.40 | slower than GPT-mini, comparable price |
+> | Sonnet 4.5 (OpenRouter) | 5/5 | 10.8 s | high (after prompt fix) | ~$15 | displaced by Haiku for this task |
+> | Kimi-K2.6 (OpenRouter) | hangs | n/a | n/a | n/a | reasoning model — ineligible |
+>
+> † order-of-magnitude pricing per million output tokens. Actual
+> per-consolidation cost depends on input + output token count.
+> ‡ One slip: GPT-5.4-mini manufactured a `decisions/` page for a
+> typo-fix session (mild over-classification), where Haiku
+> correctly emitted only the session log.
 >
 > **Production choice**: Ollama `qwen3:32b` for default
 > consolidation ($0, latency irrelevant since consolidation is
-> background work). **Hosted fallback**: Claude Haiku 4.5 — fast,
-> cheap, faithful, the best hosted-budget value of the lot.
-> Sonnet 4.5 is displaced by Haiku for this workload — same
-> reliability, 3× the cost. Reproduce in [`evals/`](../evals/).
+> background). **Best hosted fallback if budget is tight**:
+> GPT-5.4-mini (cheapest + fastest). **Best hosted fallback if
+> restraint matters most**: Haiku 4.5 (more disciplined on
+> "say nothing when there's nothing to say"). Reproduce the
+> comparison in [`evals/`](../evals/).
 
 ## Why this document exists
 
@@ -69,13 +78,15 @@ Per fixture, the runner calls
 through [`ai_memory_llm::complete_structured`](../crates/ai-memory-llm/src/lib.rs)
 (also the live path). Apples-to-apples by construction.
 
-### The four providers
+### The six providers
 
 | Tag | Provider | Model | Endpoint |
 |---|---|---|---|
 | **Kimi** | OpenRouter (openai-compat) | `moonshotai/kimi-k2.6` | `https://openrouter.ai/api/v1` |
 | **Sonnet** | OpenRouter (openai-compat) | `anthropic/claude-sonnet-4.5` | `https://openrouter.ai/api/v1` |
 | **Haiku** | OpenRouter (openai-compat) | `anthropic/claude-haiku-4.5` | `https://openrouter.ai/api/v1` |
+| **GPT-mini** | OpenRouter (openai-compat) | `openai/gpt-5.4-mini` | `https://openrouter.ai/api/v1` |
+| **DeepSeek** | OpenRouter (openai-compat) | `deepseek/deepseek-v4-flash` | `https://openrouter.ai/api/v1` |
 | **qwen3** | Ollama (openai-compat) | `qwen3:32b` (Q4_K_M, ~20 GB) | `http://192.168.0.90:11434/v1` |
 
 The home server (`192.168.0.90`) is a Ryzen AI MAX+ 395
@@ -408,6 +419,131 @@ the whole investigation. Same models, no infra changes, ~60%
 latency reduction, complete elimination of date hallucination
 on Sonnet, parse rate parity restored for qwen3.
 
+## Run 4 — budget-tier hosted comparison
+
+After establishing that Haiku 4.5 dominates Sonnet 4.5 on this
+task, the question became "is there an even cheaper hosted
+option that still works?" Tested two:
+
+### GPT-5.4-mini (OpenRouter) vs Haiku 4.5
+
+| Fixture | GPT-mini parse | GPT-mini ms | GPT-mini updates | Haiku parse | Haiku ms | Haiku updates |
+|---|---|---|---|---|---|---|
+| 01 rust-bug-fix | ✓ | 4,048 | 4 | ✓ | 9,673 | 4 |
+| 02 architecture-decision | ✓ | 4,851 | 4 | ✓ | 8,322 | 3 |
+| 03 gotcha-with-rule | ✓ | 4,212 | 4 | ✓ | 8,211 | 3 |
+| 04 low-signal-session | ✓ | 4,636 | **2*** | ✓ | 3,258 | **1** |
+| 05 multi-topic-session | ✓ | 3,997 | 3 | ✓ | 10,583 | 4 |
+| **Aggregate** | **5/5** | **avg 4.3 s** | — | **5/5** | **avg 8.0 s** | — |
+
+*GPT-5.4-mini failed the restraint test on the low-signal
+session: it manufactured an extra `decisions/docs-spelling.md`
+page for a typo fix. The content was faithful (just restated
+the typo correction), but classifying "we fixed a typo" as a
+durable architectural decision is over-extraction. Haiku
+correctly emitted just the episodic session log with
+rationale "Session was trivial; only the episodic record is
+warranted."
+
+Otherwise GPT-5.4-mini is **the fastest hosted model tested**
+(4.3 s avg, ~2× Haiku) and produces the shortest output
+(~2.3 KB on fixture 5 vs ~3.5 KB Haiku, ~2.6 KB Sonnet). No
+invented dates, no fabricated tutorial sections.
+
+### DeepSeek V4 Flash (OpenRouter) vs Haiku 4.5
+
+| Fixture | DeepSeek parse | DeepSeek ms | DeepSeek updates | Haiku parse | Haiku ms | Haiku updates |
+|---|---|---|---|---|---|---|
+| 01 rust-bug-fix | ✓ | 13,921 | 3 | ✓ | 8,817 | 4 |
+| 02 architecture-decision | ✓ | 20,835 | 4 | ✓ | 9,196 | 3 |
+| 03 gotcha-with-rule | ✓ | 54,203 | 4 | ✓ | 8,376 | 3 |
+| 04 low-signal-session | ✓ | 4,049 | **1** | ✓ | 2,837 | **1** |
+| 05 multi-topic-session | ✓ | 15,543 | 5 | ✓ | 7,616 | 3 |
+| **Aggregate** | **5/5** | **avg 21.7 s** | — | **5/5** | **avg 7.4 s** | — |
+
+DeepSeek V4 Flash passes every reliability bar — 5/5 parse,
+correct restraint on low-signal, no hallucinated dates (the
+"2026-08" that appeared in its output was *legitimately in the
+source observations*), correct `kind: rule` classification.
+Notable: fixture 3 took 54 s, suggesting variance under load
+or extended reasoning. On multi-topic it produced 5 updates
+vs the 3 the other models settled on — slightly more
+exuberant than Haiku.
+
+## Comprehensive ranking — all six providers
+
+Ranking on a 0–5 scale per axis, then aggregated.
+**Higher is better** in every column except Cost (where
+lower-cost gets a higher score). Bold = best in that column.
+
+| Provider | Parse | Speed | Cost† | Faithfulness | Restraint | Classification | Fitness for ai-memory |
+|---|---|---|---|---|---|---|---|
+| **qwen3:32b (Ollama)** | 5 | 1 | **5** ($0) | 5 | **5** | 4 | **5** — production default |
+| **Haiku 4.5** | 5 | 4 | 3 | 5 | **5** | **5** | 5 — best hosted fallback |
+| GPT-5.4-mini | 5 | **5** | **5** | 5 | 3 | 4 | 4 — cheap+fast but mild over-extraction |
+| Sonnet 4.5 | 5 | 4 | 1 | 4‡ | 4 | 3 | 3 — displaced by Haiku |
+| DeepSeek V4 Flash | 5 | 2 | 4 | 5 | **5** | **5** | 4 — solid but no edge over Haiku |
+| Kimi-K2.6 | 0 | 0 | n/a | n/a | n/a | n/a | **0** — ineligible (reasoning model) |
+
+† Cost score derived from order-of-magnitude $/M output tokens:
+$0 (qwen3) = 5; ~$0.40 (DeepSeek) = 4; ~$1 (GPT-mini) = 5 by
+amortised cost-per-task; ~$5 (Haiku) = 3; ~$15 (Sonnet) = 1.
+
+‡ Sonnet's faithfulness was 2/5 with the loose prompt (invented
+dates, fabricated alternatives sections). It recovers to 4
+after the tightened prompt — but Haiku achieved that same level
+without needing the prompt change as much, suggesting Haiku has
+better defaults for this task.
+
+### Why each column matters
+
+- **Parse**: structural reliability. Anything less than 5/5
+  means production consolidation can fail silently and lose
+  observations.
+- **Speed**: matters less for consolidation (it's a background
+  job) but compounds for lint sweeps over many pages and
+  affects developer iteration on the prompt itself.
+- **Cost**: integrates over N sessions/day × 365 days.
+  Inexpensive options change the cost from monthly-recurring
+  to negligible.
+- **Faithfulness**: does the model only write what's in the
+  observations? Critical for a *memory* wiki — fabrication
+  corrupts the long-term record.
+- **Restraint**: does the model resist manufacturing pages
+  when the session is low-signal? Lack of restraint pollutes
+  the wiki with thin, manufactured "decision" pages that
+  outweigh real content.
+- **Classification**: does the model correctly mark rules as
+  `kind: rule`, decisions as `kind: decision`, etc.? Wrong
+  classification breaks the consolidator's auto-routing to
+  `_rules/<slug>.md`.
+- **Fitness for ai-memory**: holistic verdict per provider for
+  this specific consolidation workload. Not a generic LLM
+  benchmark.
+
+### Final ordering
+
+For ai-memory's consolidation task specifically:
+
+1. **qwen3:32b on Ollama** — fits free, restrained, faithful,
+   homelab handles latency invisibly. Tied for top on every
+   non-speed axis; speed doesn't matter for background work.
+2. **Haiku 4.5** — best hosted choice when local is unreachable.
+   Restraint + classification edge over GPT-mini and DeepSeek.
+3. **GPT-5.4-mini** — pick if you're hosted-only and budget-
+   sensitive. Fastest + cheapest, only weak point is
+   over-classification of trivial sessions.
+4. **DeepSeek V4 Flash** — solid but no edge over GPT-mini or
+   Haiku on either cost+speed or quality. Pick if your stack
+   is already DeepSeek-ish.
+5. **Sonnet 4.5** — only if you specifically need the extra
+   reasoning headroom (lint sweep, cross-page contradiction
+   detection); for plain consolidation it's strictly dominated
+   by Haiku.
+6. **Kimi-K2.6** — ineligible. Reasoning model burns
+   `max_tokens` on internal thinking before emitting visible
+   content.
+
 ## Qualitative read (Run 2)
 
 Reading the raw `.md` outputs side-by-side reveals a
@@ -498,12 +634,15 @@ mode models if used in this pipeline.
 | Provider | $/run* | latency | notes |
 |---|---|---|---|
 | Ollama qwen3:32b (local) | **$0** | ~92 s | electricity not modeled |
-| Haiku 4.5 (OpenRouter) | ~$0.02 | **~7 s** | best hosted value |
-| Sonnet 4.5 (OpenRouter) | ~$0.06 | ~11 s | 3× cost of Haiku for the same task |
+| GPT-5.4-mini (OpenRouter) | ~$0.005 | **~4 s** | fastest + cheapest hosted |
+| DeepSeek V4 Flash (OpenRouter) | ~$0.005 | ~22 s | cheap but slower than GPT-mini |
+| Haiku 4.5 (OpenRouter) | ~$0.02 | ~7 s | best restraint/classification |
+| Sonnet 4.5 (OpenRouter) | ~$0.06 | ~11 s | 3× cost of Haiku for same task |
 | Kimi-K2.6 (OpenRouter) | n/a | ✗ hangs | reasoning model — ineligible |
 
 \* Rough order of magnitude; ai-memory consolidations land
-around 2–3 KB of output with the tightened prompt.
+around 2–3 KB of output with the tightened prompt. Per-run $
+multiplies $/M-tokens by the input+output token budget.
 
 ### When to revisit
 
