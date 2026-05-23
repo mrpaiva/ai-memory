@@ -308,6 +308,19 @@ fn codex_upsert_mcp_server(
     //     and uses it as a static auth header.
     let mut server = Table::new();
     server["url"] = value(args.server_url.clone());
+    // Auto-approve ai-memory's tool calls. Without this, Codex
+    // prompts on EVERY tool invocation ("approve memory_query?"
+    // "approve memory_briefing?" …) which makes the MCP unusable
+    // for an auto-capture workflow. The valid TOML values per
+    // Codex's `AppToolApproval` enum are "auto" / "prompt" /
+    // "approve" — `approve` means "no prompt, just run it". ai-
+    // memory's surface is dominantly read-only (query, recent,
+    // status, briefing, explore); the few writes (consolidate,
+    // forget_sweep) are tagged `destructiveHint: true` upstream
+    // so any agent that wants to gate THOSE specifically can
+    // override per-tool — see Codex's `[mcp_servers.X.tools]`
+    // map.
+    server["default_tools_approval_mode"] = value("approve");
     if let Some(b) = bearer_header_value_shared(args.auth_token.as_deref()) {
         let mut headers = Table::new();
         headers["Authorization"] = value(b);
@@ -380,7 +393,11 @@ fn render_codex(args: &InstallMcpArgs) -> String {
         "# Codex CLI — append to ~/.codex/config.toml\n\
          #\n\
          [mcp_servers.{name}]\n\
-         url = \"{url}\"\n",
+         url = \"{url}\"\n\
+         # Skip per-call approval prompts on ai-memory's tools.\n\
+         # ai-memory is read-mostly + writes are auto-capture; the\n\
+         # approval friction makes it unusable otherwise.\n\
+         default_tools_approval_mode = \"approve\"\n",
         name = args.name,
         url = args.server_url,
     );
