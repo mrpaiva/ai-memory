@@ -1,6 +1,7 @@
 //! Admin HTTP routes — state-touching operations invoked by the CLI
 //! over plain HTTP (not MCP). Currently exposes:
 //!
+//! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
@@ -12,6 +13,7 @@
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -25,20 +27,23 @@ use ai_memory_consolidate::{
     Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource, SourceCounts, run_lint,
     run_sweep,
 };
-use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{
     DecayParams, PurgeSummary, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::Wiki;
+use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -90,6 +95,7 @@ fn default_max_input_tokens() -> usize {
 }
 
 /// Build the admin axum [`Router`]. Mounts:
+/// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
 /// - `GET  /admin/status`
 /// - `GET  /admin/search`
@@ -100,8 +106,10 @@ fn default_max_input_tokens() -> usize {
 /// - `POST /admin/commit`
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
+/// - `POST /admin/write-page`
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
+        .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/status", get(handle_status))
         .route("/admin/search", get(handle_search))
@@ -112,7 +120,89 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/commit", post(handle_commit))
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/rename-project", post(handle_rename_project))
+        .route("/admin/write-page", post(handle_write_page))
         .with_state(Arc::new(state))
+}
+
+// ---------------------------------------------------------------------
+// backup
+// ---------------------------------------------------------------------
+
+/// Handler for `POST /admin/backup`.
+///
+/// Snapshots the live SQLite DB via the online backup API, then
+/// tar-gzips `wiki/`, the snapshot, and `config.toml` (if present)
+/// into an in-memory buffer. The response body IS the tarball bytes —
+/// `Content-Type: application/gzip`, no JSON wrapper.
+async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
+    match build_backup_tarball(&state).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"backup.tar.gz\"",
+            )
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        Err(e) => {
+            warn!(error = %e, "backup failed");
+            let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                })
+        }
+    }
+}
+
+async fn build_backup_tarball(state: &AdminState) -> anyhow::Result<Vec<u8>> {
+    let staging = tempfile::tempdir()?;
+    let snapshot_path = staging.path().join("memory.sqlite");
+    info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
+    state
+        .reader
+        .snapshot_to(snapshot_path.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("sqlite snapshot: {e}"))?;
+
+    let mut buf = Vec::new();
+    {
+        let encoder = GzEncoder::new(&mut buf, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+
+        let wiki_dir = state.data_dir.join("wiki");
+        if wiki_dir.is_dir() {
+            tar.append_dir_all("wiki", &wiki_dir)
+                .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
+        }
+
+        tar.append_path_with_name(&snapshot_path, "db/memory.sqlite")
+            .map_err(|e| anyhow::anyhow!("archiving db snapshot: {e}"))?;
+
+        let cfg = state.data_dir.join("config.toml");
+        if cfg.is_file() {
+            tar.append_path_with_name(&cfg, "config.toml")
+                .map_err(|e| anyhow::anyhow!("archiving config.toml: {e}"))?;
+        }
+
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------
@@ -1120,4 +1210,119 @@ async fn handle_rename_project(
         StatusCode::OK,
         Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
     )
+}
+
+// ---------------------------------------------------------------------
+// write-page
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/write-page`.
+#[derive(Deserialize)]
+struct WritePageAdminRequest {
+    /// Workspace name (auto-created if absent).
+    workspace: String,
+    /// Project name (auto-created if absent).
+    project: String,
+    /// Relative wiki path (e.g. `concepts/foo.md`).
+    path: String,
+    /// Markdown body. The server frames it with frontmatter; pass plain body content.
+    body: String,
+    /// Optional title; derived from first H1 or path stem when absent.
+    #[serde(default)]
+    title: Option<String>,
+    /// Tier name (`working`, `episodic`, `semantic`, `procedural`).
+    #[serde(default = "default_write_tier")]
+    tier: String,
+    /// Tags to attach to the page.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Pin the page so the decay sweep skips it.
+    #[serde(default)]
+    pinned: bool,
+}
+
+fn default_write_tier() -> String {
+    "semantic".to_string()
+}
+
+/// JSON response body for `POST /admin/write-page`.
+#[derive(Serialize)]
+struct WritePageResponse {
+    /// UUID of the written page.
+    page_id: String,
+    /// Canonical wiki path.
+    path: String,
+}
+
+async fn handle_write_page(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<WritePageAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let tier: Tier = req.tier.parse().map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("unknown tier '{}'", req.tier)
+            })),
+        )
+    })?;
+
+    let path = PagePath::new(req.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
+
+    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+
+    let mut fm = serde_json::Map::new();
+    if let Some(title) = &req.title {
+        fm.insert("title".into(), serde_json::Value::String(title.clone()));
+    }
+    if !req.tags.is_empty() {
+        fm.insert(
+            "tags".into(),
+            serde_json::Value::Array(
+                req.tags
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if req.pinned {
+        fm.insert("pinned".into(), serde_json::Value::Bool(true));
+    }
+    let frontmatter = if fm.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(fm)
+    };
+
+    let page_id = state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter,
+            body: req.body,
+            tier,
+            pinned: req.pinned,
+            title: req.title,
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(WritePageResponse {
+                page_id: page_id.to_string(),
+                path: path.to_string(),
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
 }

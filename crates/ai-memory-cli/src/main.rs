@@ -43,7 +43,6 @@ async fn main() -> Result<()> {
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::Search(args) => commands::search::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
-        Command::Watch(args) => commands::watch::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
         Command::Backup(args) => commands::backup::run(&config, args).await,

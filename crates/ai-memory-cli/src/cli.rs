@@ -35,8 +35,6 @@ pub enum Command {
     Search(SearchArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
-    /// Run the filesystem watcher (foreground; Ctrl-C to stop).
-    Watch(WatchArgs),
     /// Run the MCP server (with watcher) over stdio or HTTP.
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
@@ -292,17 +290,6 @@ pub struct SearchArgs {
     /// Emit results as JSON.
     #[arg(long)]
     pub json: bool,
-}
-
-/// Arguments for `watch`.
-#[derive(Debug, Args)]
-pub struct WatchArgs {
-    /// Workspace name to attribute discovered files to (auto-created).
-    #[arg(long, default_value = "default")]
-    pub workspace: String,
-    /// Project name within the workspace (auto-created).
-    #[arg(long, default_value = "scratch")]
-    pub project: String,
 }
 
 /// Arguments for `reset`.

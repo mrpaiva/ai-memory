@@ -110,11 +110,17 @@ blocking issue:**
     writer of wiki + SQLite. CLI commands NEVER call `Store::open`,
     `Wiki::new`, `build_provider`, or `build_embedder`. State
     mutations go through `/admin/*` HTTP routes; reads go through
-    MCP tools or `/admin/*` GETs. The two exceptions are
-    `init` / `serve` / `generate-auth-token` / `install-*` /
-    `setup-agent` — local-only setup commands that don't touch
-    server state. Use the shared `crate::http_client::{ServerEndpoint,
-    get_json, post_json}` plumbing for every new client subcommand.
+    MCP tools or `/admin/*` GETs. Exceptions to "always an HTTP client":
+    - `init`, `generate-auth-token`, `install-*`, `setup-agent` —
+      pre-server local setup (no state mutation).
+    - `serve` — IS the server.
+    - `llm-test` — pre-server credential smoke test (hits the external
+      LLM only; no ai-memory state).
+    - `reset`, `restore` — lifecycle ops that fundamentally require the
+      server stopped (a live writer would race with the wipe/extract).
+      Both use `sysinfo` to refuse if any sibling `ai-memory` is alive.
+    Use the shared `crate::http_client::{ServerEndpoint, get_json,
+    post_json}` plumbing for every new client subcommand.
 
 ## Mistakes documented in the research — do NOT repeat
 

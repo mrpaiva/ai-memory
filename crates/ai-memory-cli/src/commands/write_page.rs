@@ -1,85 +1,80 @@
-//! `ai-memory write-page` — testing helper for the M1-C wiki write path.
+//! `ai-memory write-page` — write or update a wiki page via the server.
 //!
-//! Once hooks (M3) and consolidation (M7) are wired, real callers will
-//! flow through those, not this command. It stays around as a manual
-//! escape hatch and to exercise the chain in development.
+//! Sends a `POST /admin/write-page` request to the running server.
+//! The server handles workspace/project resolution, tier parsing,
+//! frontmatter framing, and the atomic wiki write.
 
 use std::io::Read;
 
-use ai_memory_core::{PagePath, Tier};
-use ai_memory_store::Store;
-use ai_memory_wiki::{Wiki, WritePageRequest};
 use anyhow::{Context, Result};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::cli::WritePageArgs;
 use crate::config::Config;
+use crate::http_client::{ServerEndpoint, post_json};
+
+#[derive(Serialize)]
+struct WritePageBody {
+    workspace: String,
+    project: String,
+    path: String,
+    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    tier: String,
+    tags: Vec<String>,
+    pinned: bool,
+}
+
+#[derive(Deserialize)]
+struct WritePageResponseBody {
+    page_id: String,
+    path: String,
+}
 
 /// Run the `write-page` subcommand.
 ///
 /// # Errors
-/// Returns an error if the store cannot be opened, the path is invalid,
-/// the tier is unknown, the body cannot be read, or the underlying
-/// `Wiki::write_page` call fails.
-pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
-    let body = if args.body == "-" {
+/// Returns an error if stdin cannot be read (when `body == "-"`), or if
+/// the POST to `/admin/write-page` fails.
+pub async fn run(_config: &Config, args: WritePageArgs) -> Result<()> {
+    let body_text = if args.body == "-" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading body from stdin")?;
         buf
     } else {
         args.body
     };
-    let tier: Tier = args.tier.parse()?;
-    let path = PagePath::new(args.path.clone())?;
 
-    let store = Store::open(&config.data_dir)
-        .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
-    let ws = store
-        .writer
-        .get_or_create_workspace(args.workspace.clone())
-        .await?;
-    let proj = store
-        .writer
-        .get_or_create_project(ws, args.project.clone(), None)
-        .await?;
+    // `project` has a non-empty default ("scratch"); pass it directly so the
+    // explicit --project flag always wins. The auto-detect path is only useful
+    // for commands whose project arg is truly optional (no default).
+    let project = args.project.clone();
 
-    let wiki = Wiki::new(&config.data_dir, store.writer.clone())?;
-
-    let mut fm = Map::new();
-    if let Some(title) = args.title {
-        fm.insert("title".into(), Value::String(title));
-    }
-    if !args.tag.is_empty() {
-        fm.insert(
-            "tags".into(),
-            Value::Array(args.tag.into_iter().map(Value::String).collect()),
-        );
-    }
-    if args.pinned {
-        fm.insert("pinned".into(), Value::Bool(true));
-    }
-    let frontmatter = if fm.is_empty() {
-        Value::Null
-    } else {
-        Value::Object(fm)
-    };
-
-    let id = wiki
-        .write_page(WritePageRequest {
-            workspace_id: ws,
-            project_id: proj,
-            path: path.clone(),
-            frontmatter,
-            body,
-            tier,
+    let endpoint = ServerEndpoint::from_env();
+    let resp: WritePageResponseBody = post_json(
+        &endpoint,
+        "/admin/write-page",
+        &WritePageBody {
+            workspace: args.workspace.clone(),
+            project: project.clone(),
+            path: args.path.clone(),
+            body: body_text,
+            title: args.title,
+            tier: args.tier,
+            tags: args.tag,
             pinned: args.pinned,
-            title: None,
-        })
-        .await?;
+        },
+    )
+    .await
+    .context("writing page via server")?;
 
+    let short_id = &resp.page_id[..resp.page_id.len().min(8)];
     println!(
-        "wrote {} ({}) under workspace={} project={}",
-        path, id, args.workspace, args.project
+        "✓ wrote {} (page_id={}) under {}/{}",
+        resp.path, short_id, args.workspace, project
     );
     Ok(())
 }

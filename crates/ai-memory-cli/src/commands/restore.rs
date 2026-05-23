@@ -4,6 +4,15 @@
 //! Refuses while another `ai-memory` process is alive. After extraction,
 //! re-opens the store so any pending migrations run (and a corrupt
 //! snapshot fails loudly).
+//!
+//! # Exception to invariant §16
+//!
+//! `restore` is one of the documented exceptions to the rule that the CLI
+//! is always a thin HTTP client. Restoration is a lifecycle operation that
+//! fundamentally requires the server to be stopped: extracting a tarball
+//! over a live SQLite WAL writer would corrupt the database. The sysinfo
+//! guard at the top of `run` enforces this precondition by refusing to
+//! proceed when any sibling `ai-memory` process is detected.
 
 use ai_memory_store::Store;
 use anyhow::{Context, Result, bail};

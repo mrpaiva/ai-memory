@@ -123,6 +123,34 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
         .with_context(|| format!("parsing JSON body from POST {url}"))
 }
 
+/// POST an empty body to `<endpoint>{path}`, return the raw response bytes.
+///
+/// Intended for routes whose response is binary (e.g. `POST /admin/backup`
+/// returns an `application/gzip` tarball). On non-2xx the response body is
+/// consumed and returned as an error string.
+///
+/// # Errors
+/// Returns an error when the connection fails, the response is non-2xx,
+/// or the body cannot be read.
+pub async fn post_bytes(endpoint: &ServerEndpoint, path: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}{path}", endpoint.url);
+    let req = endpoint.authenticate(client.post(&url));
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("POST {url} (is the server running at {}?)", endpoint.url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("server returned {status}: {body}");
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .with_context(|| format!("reading response bytes from POST {url}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
