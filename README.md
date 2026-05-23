@@ -34,6 +34,11 @@ priors are at the [bottom](#influences-and-prior-art).
 You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, Cursor,
 or anything else that speaks MCP).
 
+The default quick-start has **no authentication** — the server binds
+to loopback only, so on a single-user laptop nothing else can reach
+it. Adding a bearer token is a one-line change once you're ready to
+expose the server on the LAN; see [Security](#security) below.
+
 ```bash
 # 1. Install the ai-memory CLI wrapper (a ~3 KB shell script that
 #    runs the binary inside docker with your $HOME mounted). This is
@@ -46,52 +51,50 @@ chmod +x ~/.local/bin/ai-memory
 # ai-memory` comes up empty, add this to ~/.bashrc / ~/.zshrc:
 #     export PATH="$HOME/.local/bin:$PATH"
 
-# 2. Generate a bearer token (one-time; save it).
-export AI_MEMORY_AUTH_TOKEN=$(ai-memory generate-auth-token)
-
-# 3. Start the server. `--restart unless-stopped` makes it come back
+# 2. Start the server. `--restart unless-stopped` makes it come back
 #    on docker daemon restart and on machine boot (provided your
 #    docker service is enabled at boot — `sudo systemctl enable
-#    docker` on most distros). Omit the LLM / EMBEDDING lines for
-#    zero-LLM mode — FTS5 search still works without any keys.
+#    docker` on most distros). Loopback-only bind (`127.0.0.1:49374`)
+#    so nothing outside this machine can reach it. Omit the LLM /
+#    EMBEDDING lines for zero-LLM mode — FTS5 search still works
+#    without any keys.
 docker run -d --name ai-memory \
     --restart unless-stopped \
-    -p 49374:49374 \
+    -p 127.0.0.1:49374:49374 \
     -v ai-memory-data:/data \
-    -e AI_MEMORY_AUTH_TOKEN="$AI_MEMORY_AUTH_TOKEN" \
     -e AI_MEMORY_LLM_PROVIDER=anthropic \
     -e ANTHROPIC_API_KEY=sk-ant-... \
     -e AI_MEMORY_EMBEDDING_PROVIDER=openai \
     -e OPENAI_API_KEY=sk-... \
     akitaonrails/ai-memory:latest
 
-# 4. Wire your agent CLI in two commands. The wrapper takes care of
+# 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
 #    `--agent codex`, `--agent opencode`, `--client cursor`, etc.
 #    for additional agents; full list in docs/install.md.
-ai-memory install-mcp   --client claude-code --apply \
-    --server-url "http://localhost:49374/mcp"
-ai-memory install-hooks --agent  claude-code --apply \
-    --server-url "http://localhost:49374"
+ai-memory install-mcp   --client claude-code --apply
+ai-memory install-hooks --agent  claude-code --apply
 ```
-
-Both `install-mcp` and `install-hooks` are idempotent — re-runs
-replace ai-memory's entry, preserve every other server / hook the
-user has configured, and write a timestamped `.bak-<ts>` next to the
-file before each modifying write. The hook scripts are staged into
-`~/.local/share/ai-memory/hooks/<agent>/` automatically; re-running
-overwrites them so future image updates ship updated hooks. Drop
-`--apply` to print the snippet instead of mutating.
 
 That's it. Start a Claude Code session as usual — every prompt and
 tool call now lands in ai-memory, and the next session you open in
 this project will see a handoff with where you left off.
 
+The `install-mcp` / `install-hooks` commands default to
+`http://127.0.0.1:49374` (matching the server above) and no bearer
+token. Both are idempotent — re-runs replace ai-memory's entry,
+preserve every other server / hook you have configured, and write a
+timestamped `.bak-<ts>` next to the file before each modifying
+write. The hook scripts are staged into
+`~/.local/share/ai-memory/hooks/<agent>/` automatically; re-running
+overwrites them so future image updates ship updated hooks. Drop
+`--apply` to print the snippet instead of mutating.
+
 > **Prefer docker compose?** Clone the repo and run
 > `docker compose -f docker/docker-compose.yml up -d` instead of
-> step 3. The bundled compose file already has
+> step 2. The bundled compose file already has
 > `restart: unless-stopped`, a healthcheck, and the named volume
-> wired up; step 4 is identical.
+> wired up; step 3 is identical.
 
 ### Keeping ai-memory up to date
 
@@ -130,6 +133,97 @@ Gemini CLI, OpenClaw, the curl-based hook installer (no docker
 needed), running ai-memory without docker, the full subcommand
 reference, the homelab deploy pattern, security hardening — see
 [**`docs/install.md`**](docs/install.md).
+
+## Configuring the CLI
+
+The `ai-memory` binary is a thin HTTP client. It never opens the
+wiki or SQLite directly — every state-touching command goes through
+the running server, which is the sole writer.
+
+Configuration is two environment variables, both **optional**:
+
+| Variable | Default | When to set it |
+|---|---|---|
+| `AI_MEMORY_SERVER_URL` | `http://127.0.0.1:49374` | When the server runs somewhere other than this machine (e.g. a homelab at `http://192.168.0.90:49374`). |
+| `AI_MEMORY_AUTH_TOKEN` | unset (no auth) | When the server has bearer auth enabled — see [Security](#security). |
+
+For the **single-laptop local case** you don't need either: the CLI
+talks to the loopback server with no credentials and just works.
+
+For a **remote / homelab** server, set both in your shell rc (or a
+`.envrc` if you use direnv):
+
+```bash
+export AI_MEMORY_SERVER_URL="http://192.168.0.90:49374"
+export AI_MEMORY_AUTH_TOKEN="b9a5075d…"
+```
+
+The `init`, `serve`, `install-*`, `generate-auth-token`, and
+`setup-agent` subcommands don't need these env vars — they either
+set up local files or start the server itself.
+
+## Security
+
+The default Quick start runs **without authentication** because the
+server is bound to loopback (`127.0.0.1:49374`) — no process outside
+this machine can reach it. That's the safest default for a personal
+laptop and matches the "single-user, single-machine" use case the
+project is optimised for.
+
+You need to enable bearer authentication if **any of these are
+true:**
+
+- The server is exposed beyond loopback (LAN, VPN, reverse proxy,
+  cloud).
+- More than one untrusted process runs on the same machine.
+- The data dir contains observations from sensitive projects you
+  wouldn't want any local user to read.
+
+To enable it:
+
+```bash
+# 1. Generate a token (one-time; save the output somewhere).
+TOKEN=$(ai-memory generate-auth-token)
+echo "$TOKEN"   # 64 hex chars
+
+# 2. Pass it to the server on startup.
+docker run -d --name ai-memory \
+    --restart unless-stopped \
+    -p 0.0.0.0:49374:49374 \
+    -v ai-memory-data:/data \
+    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
+    -e AI_MEMORY_LLM_PROVIDER=anthropic \
+    -e ANTHROPIC_API_KEY=sk-ant-... \
+    akitaonrails/ai-memory:latest
+
+# 3. Set the same token in every client environment that needs to
+#    reach this server:
+export AI_MEMORY_AUTH_TOKEN="$TOKEN"
+
+# 4. Re-run install-mcp / install-hooks so the agent configs pick
+#    up the new token + URL. The wrapper reads AI_MEMORY_AUTH_TOKEN
+#    from your env and embeds it in the generated config.
+ai-memory install-mcp   --client claude-code --apply \
+    --server-url "http://192.168.0.90:49374/mcp"
+ai-memory install-hooks --agent  claude-code --apply \
+    --server-url "http://192.168.0.90:49374"
+```
+
+When the server has `AI_MEMORY_AUTH_TOKEN` set, every request to
+`/mcp`, `/hook`, `/handoff`, `/admin/*`, and `/web/*` must present
+the token. For HTTP clients (MCP, hooks, CLI) that means the
+`Authorization: Bearer <token>` header. For the `/web/*` browser
+flow it's HTTP Basic auth (the browser shows a native dialog;
+username is ignored, paste the token as the password). Constant-time
+token comparison via `subtle::ConstantTimeEq` rules out timing-based
+recovery.
+
+When the server has **no** `AI_MEMORY_AUTH_TOKEN` set AND binds to a
+non-loopback address, it logs a loud `warn` on startup. That's the
+signal to either lock the bind back to `127.0.0.1` or set a token.
+
+See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
+(bearer + TLS via cloudflared + reverse proxy).
 
 ## How it works in practice
 
@@ -173,10 +267,12 @@ solves that by LLM-summarising your existing `git log`, README,
 `docs/`, and module-level doc-comments into seed wiki pages.
 
 ```bash
-# Run from your project's repo root (requires an LLM provider on the
-# server). Default settings ingest everything; budget caps at 50k
-# input tokens (~$0.05 with Claude Haiku 4.5). The wrapper auto-mounts the
-# data volume and $PWD into the container.
+# Run from your project's repo root. The CLI collects sources locally
+# (git log, README, docs/, module headers) and POSTs them to the server
+# at AI_MEMORY_SERVER_URL, where the LLM call and wiki writes happen.
+# Requires an LLM provider configured on the server. Budget caps at
+# 50k input tokens (~$0.05 with Claude Haiku 4.5).
+export AI_MEMORY_SERVER_URL="http://localhost:49374"
 ai-memory bootstrap --workspace homelab --project myproj
 ```
 

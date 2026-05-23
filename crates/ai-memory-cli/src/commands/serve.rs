@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::Sanitizer;
 use ai_memory_hooks::{HookState, hook_router};
-use ai_memory_llm::{build_embedder, embedder_from_env, provider_from_env};
-use ai_memory_mcp::AiMemoryServer;
+use ai_memory_llm::{build_embedder, build_provider, embedder_from_env, provider_from_env};
+use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
 use ai_memory_store::Store;
 use ai_memory_web;
 use ai_memory_wiki::{WatcherHandle, Wiki};
@@ -106,10 +106,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         server = server.with_embedder(e);
     }
     // Build the consolidator (if LLM configured) once, then share the
-    // Arc between the MCP server (for `memory_consolidate` + lint) and
-    // the hook router (for PreCompact checkpointing).
+    // Arc between the MCP server (for `memory_consolidate` + lint),
+    // the hook router (for PreCompact checkpointing), and the admin
+    // router (for `POST /admin/bootstrap`).
+    let mut admin_llm: Option<Arc<dyn ai_memory_llm::LlmProvider>> = None;
     let consolidator: Option<Arc<Consolidator>> = if let Some(cfg) = provider_from_env()? {
-        let llm = ai_memory_llm::build_provider(cfg).context("building LLM provider from env")?;
+        let llm = build_provider(cfg).context("building LLM provider from env")?;
         info!(
             provider = llm.name(),
             model = llm.model(),
@@ -123,7 +125,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             ws,
             proj,
         ));
-        server = server.with_consolidator_arc(wiki.clone(), llm, c.clone());
+        server = server.with_consolidator_arc(wiki.clone(), llm.clone(), c.clone());
+        admin_llm = Some(llm);
         Some(c)
     } else {
         info!(
@@ -172,6 +175,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     std::collections::HashMap::new(),
                 )),
             });
+            let admin = admin_router(AdminState {
+                writer: store.writer.clone(),
+                reader: store.reader.clone(),
+                wiki: wiki.clone(),
+                llm: admin_llm,
+            });
             // Build the auth state. Precedence (highest first):
             //   1. AI_MEMORY_AUTH_TOKEN env var
             //   2. config.toml [auth].bearer_token
@@ -187,7 +196,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let auth_enabled = auth_state.enabled();
             let mut router = axum::Router::new()
                 .nest_service("/mcp", mcp_service)
-                .merge(hooks);
+                .merge(hooks)
+                .merge(admin);
 
             // Register the web router BEFORE applying the bearer
             // middleware. In axum 0.8, `.layer()` only attaches to

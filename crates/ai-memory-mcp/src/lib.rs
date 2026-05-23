@@ -8,6 +8,8 @@
 //! agentmemory #510 / #553 "negotiated-down to a version the client
 //! discards tools for" failure mode.
 
+pub mod admin;
 mod server;
 
+pub use admin::{AdminState, admin_router};
 pub use server::{AiMemoryServer, MEMORY_INSTRUCTIONS};

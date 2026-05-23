@@ -1,21 +1,19 @@
 //! `ai-memory bootstrap` — ingest an existing project's history.
 //!
-//! Thin CLI wrapper around `ai_memory_consolidate::Bootstrap`. The
-//! heavy lifting (source collection, prioritisation, LLM call,
-//! wiki write) lives in the consolidate crate; this file just
-//! resolves CLI args into a `BootstrapConfig` and dispatches.
+//! Thin HTTP client wrapper. Source collection (git log, README, docs/,
+//! Rust module headers, project-rules files) happens locally via
+//! `ai_memory_consolidate::collect_sources`; the resulting bundle is
+//! POSTed to `POST /admin/bootstrap` on the running server, which does
+//! the LLM call and wiki writes. The CLI never opens a `Store` or `Wiki`
+//! directly.
 //!
-//! Resolves the repo path via `git rev-parse --show-toplevel` when
-//! `--repo-path` is omitted, so running from any subdirectory of
-//! the target project works.
+//! Required environment variables (see "Configuring the CLI" in README):
+//! - `AI_MEMORY_SERVER_URL` — base URL of the running server.
+//! - `AI_MEMORY_AUTH_TOKEN` — bearer token if the server has auth enabled.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use ai_memory_consolidate::{Bootstrap, BootstrapConfig, BootstrapOutcome};
-use ai_memory_llm::{build_provider, provider_from_env};
-use ai_memory_store::Store;
-use ai_memory_wiki::Wiki;
+use ai_memory_consolidate::{BootstrapOutcome, collect_sources};
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
@@ -24,27 +22,30 @@ use crate::config::Config;
 
 /// Run the `bootstrap` subcommand.
 ///
+/// Collects sources locally from the project repo, then POSTs the
+/// bundle to the server's `POST /admin/bootstrap` endpoint.
+///
 /// # Errors
-/// Bails when an LLM provider isn't configured (bootstrap can't run
-/// without one), when the resolved repo path isn't a git repo, when
-/// the project was already bootstrapped without `--force`, or when
-/// any source-collection / LLM / wiki write fails.
-pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
-    // ---- LLM provider — required ----
-    let Some(llm_cfg) = provider_from_env()? else {
-        bail!(
-            "bootstrap requires an LLM provider. Set AI_MEMORY_LLM_PROVIDER \
-             (and the matching API key) and try again."
-        );
-    };
-    let llm = build_provider(llm_cfg).context("building LLM provider from env")?;
-    info!(
-        provider = llm.name(),
-        model = llm.model(),
-        "bootstrap LLM enabled"
-    );
+/// Bails when `AI_MEMORY_SERVER_URL` is unset, when the resolved repo
+/// path is not a git repo, when source collection fails, or when the
+/// server returns a non-2xx response.
+pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
+    // ---- server URL — defaults to loopback ------------------------
+    // The CLI is a thin HTTP client. With no env var it talks to a
+    // local server on the default port; set AI_MEMORY_SERVER_URL to
+    // point at a remote (e.g. homelab).
+    let server_url = std::env::var("AI_MEMORY_SERVER_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:49374".to_string());
+    // Bearer is optional: only sent when the env var is non-empty.
+    // A loopback server with no token set accepts every request.
+    let auth_token = std::env::var("AI_MEMORY_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    info!(%server_url, auth = auth_token.is_some(), "bootstrap CLI configured");
 
-    // ---- repo path — auto-detect if absent ----
+    // ---- repo path — auto-detect if absent -------------------------
     let repo_path = match args.repo_path {
         Some(p) => p,
         None => resolve_repo_root().context("auto-detecting --repo-path via git rev-parse")?,
@@ -57,41 +58,44 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         );
     }
 
-    // ---- open store + wiki ----
-    let store = Store::open(&config.data_dir)
-        .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
-    let ws = store
-        .writer
-        .get_or_create_workspace(args.workspace.clone())
-        .await?;
-    let proj = store
-        .writer
-        .get_or_create_project(ws, args.project.clone(), None)
-        .await?;
-    let wiki = Wiki::new(&config.data_dir, store.writer.clone())?;
+    // ---- collect sources locally ----------------------------------
+    let sources = collect_sources(
+        &repo_path,
+        args.since.as_deref(),
+        !args.exclude_git,
+        !args.exclude_readme,
+        !args.exclude_docs,
+        !args.exclude_code,
+    )?;
+    info!(sources = sources.len(), "collected sources from repo");
 
-    // ---- run bootstrap ----
-    let cfg = BootstrapConfig {
-        repo_path: repo_path.clone(),
-        workspace_id: ws,
-        project_id: proj,
-        max_input_tokens: args.max_input_tokens,
-        include_git: !args.exclude_git,
-        include_readme: !args.exclude_readme,
-        include_docs: !args.exclude_docs,
-        include_code: !args.exclude_code,
-        since: args.since,
-        dry_run: args.dry_run,
-        force: args.force,
-    };
-    let bootstrap = Bootstrap {
-        reader: store.reader.clone(),
-        wiki,
-        llm: Arc::clone(&llm),
-    };
-    let outcome = bootstrap.run(&cfg).await?;
+    // ---- POST to server -------------------------------------------
+    let client = reqwest::Client::new();
+    let url = format!("{}/admin/bootstrap", server_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "workspace": args.workspace,
+        "project": args.project,
+        "sources": sources,
+        "max_input_tokens": args.max_input_tokens,
+        "dry_run": args.dry_run,
+        "force": args.force,
+    });
+    let mut req = client.post(&url).json(&body);
+    if let Some(t) = &auth_token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.context("POST /admin/bootstrap")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("server returned {}: {}", status, text);
+    }
+    let outcome: BootstrapOutcome = resp
+        .json()
+        .await
+        .context("parsing BootstrapOutcome JSON from server response")?;
+
     print_human_report(&outcome, &args.workspace, &args.project);
-    // Also emit the machine-readable JSON at the end for scripted callers.
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
     Ok(())
@@ -107,7 +111,7 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
     } else {
         "Bootstrap"
     };
-    println!("\n✓ {kind} complete for {workspace}/{project}\n");
+    println!("\n{kind} complete for {workspace}/{project}\n");
 
     println!("Sources loaded into the LLM:");
     let c = &outcome.sources_by_kind;
@@ -137,13 +141,13 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
     }
     if c.project_rules > 0 {
         println!(
-            "  - {} project-rules file{} (CLAUDE.md / AGENTS.md / …)",
+            "  - {} project-rules file{} (CLAUDE.md / AGENTS.md / ...)",
             c.project_rules,
             if c.project_rules == 1 { "" } else { "s" }
         );
     }
     println!(
-        "  → ~{} input tokens estimated{}",
+        "  -> ~{} input tokens estimated{}",
         outcome.estimated_input_tokens,
         if outcome.sources_dropped > 0 {
             format!(
@@ -161,7 +165,7 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
     );
 
     if outcome.dry_run {
-        println!("\n(dry-run — no LLM call, no pages written)");
+        println!("\n(dry-run -- no LLM call, no pages written)");
     } else {
         println!(
             "\nGenerated {} wiki page{}:",
@@ -181,7 +185,7 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
     }
 
     println!(
-        "\n⚠ What ai-memory knows now\n  \
+        "\nWhat ai-memory knows now\n  \
          Only the sources listed above. NOT every file in your project,\n  \
          NOT every commit since project start, NOT runtime behaviour or\n  \
          test logs. As you use Claude Code (or another MCP agent) the\n  \

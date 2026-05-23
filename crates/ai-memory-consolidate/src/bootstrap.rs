@@ -80,7 +80,8 @@ pub enum BootstrapError {
 }
 
 /// What kind of source we collected text from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// A line summary of one commit.
     GitCommit,
@@ -117,7 +118,7 @@ impl SourceKind {
 }
 
 /// One unit of source text fed to the LLM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapSource {
     /// Origin (used for prioritisation when over budget).
     pub kind: SourceKind,
@@ -168,7 +169,7 @@ pub struct BootstrapBatch {
 /// CLI surface "we loaded 23 commits + the README + 8 docs" rather
 /// than a single opaque sources-count, so the user can calibrate
 /// what ai-memory actually saw vs. didn't.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceCounts {
     /// Number of git-commit summaries kept.
     pub git_commits: usize,
@@ -201,7 +202,7 @@ impl SourceCounts {
 }
 
 /// Outcome reported back to the CLI.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapOutcome {
     /// Number of sources collected (before any budget pruning).
     pub sources_collected: usize,
@@ -266,13 +267,18 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
-    /// Run the bootstrap pipeline end-to-end.
+    /// Process pre-collected sources end-to-end: prune to budget,
+    /// call the LLM, write pages, return the outcome. Server-side
+    /// entry point — does NOT collect from disk.
     ///
     /// # Errors
-    /// Propagates [`BootstrapError`] for any of: missing repo, LLM
-    /// failure, wiki write failure, or already-bootstrapped (without
-    /// `--force`).
-    pub async fn run(&self, cfg: &BootstrapConfig) -> Result<BootstrapOutcome, BootstrapError> {
+    /// Propagates [`BootstrapError`] for any of: LLM failure, wiki
+    /// write failure, or already-bootstrapped (without `--force`).
+    pub async fn process_sources(
+        &self,
+        cfg: &BootstrapConfig,
+        sources: Vec<BootstrapSource>,
+    ) -> Result<BootstrapOutcome, BootstrapError> {
         // ---- idempotency check ------------------------------------
         // The reader pool's recent_pages isn't (workspace, project)-
         // scoped, so we use the wiki's filesystem read as the cheap
@@ -285,22 +291,6 @@ impl Bootstrap {
                 return Err(BootstrapError::AlreadyBootstrapped);
             }
         }
-
-        // ---- source collection ------------------------------------
-        let mut sources = Vec::<BootstrapSource>::new();
-        if cfg.include_git {
-            sources.extend(collect_git_commits(&cfg.repo_path, cfg.since.as_deref())?);
-        }
-        if cfg.include_readme {
-            sources.extend(collect_readme(&cfg.repo_path)?);
-        }
-        if cfg.include_docs {
-            sources.extend(collect_docs(&cfg.repo_path)?);
-        }
-        if cfg.include_code {
-            sources.extend(collect_rust_module_headers(&cfg.repo_path)?);
-        }
-        sources.extend(collect_project_rules(&cfg.repo_path)?);
 
         if sources.is_empty() {
             return Err(BootstrapError::NoSources);
@@ -407,11 +397,64 @@ impl Bootstrap {
             dry_run: false,
         })
     }
+
+    /// Convenience wrapper that collects sources from disk then runs
+    /// [`Self::process_sources`]. Used by tests and any direct caller
+    /// that has filesystem access.
+    ///
+    /// # Errors
+    /// Propagates [`BootstrapError`] from either collection or processing.
+    pub async fn run(&self, cfg: &BootstrapConfig) -> Result<BootstrapOutcome, BootstrapError> {
+        let sources = collect_sources(
+            &cfg.repo_path,
+            cfg.since.as_deref(),
+            cfg.include_git,
+            cfg.include_readme,
+            cfg.include_docs,
+            cfg.include_code,
+        )?;
+        self.process_sources(cfg, sources).await
+    }
 }
 
 // --------------------------------------------------------------------
 // Source collection
 // --------------------------------------------------------------------
+
+/// Collect sources from a project repo on disk. IO-only — no LLM,
+/// no store, no wiki. The CLI calls this before posting the bundle
+/// to the server; the server's own bootstrap-route handler does NOT
+/// call this (the server can't see the caller's filesystem).
+///
+/// # Errors
+/// Returns [`BootstrapError`] when the repo path is invalid, files
+/// can't be read, or the git history can't be walked.
+pub fn collect_sources(
+    repo_path: &std::path::Path,
+    since: Option<&str>,
+    include_git: bool,
+    include_readme: bool,
+    include_docs: bool,
+    include_code: bool,
+) -> Result<Vec<BootstrapSource>, BootstrapError> {
+    let mut sources = Vec::<BootstrapSource>::new();
+    if include_git {
+        sources.extend(collect_git_commits(repo_path, since)?);
+    }
+    if include_readme {
+        sources.extend(collect_readme(repo_path)?);
+    }
+    if include_docs {
+        sources.extend(collect_docs(repo_path)?);
+    }
+    if include_code {
+        sources.extend(collect_rust_module_headers(repo_path)?);
+    }
+    // Project-rules files (CLAUDE.md / AGENTS.md) are always collected —
+    // they're the highest-signal input and very small.
+    sources.extend(collect_project_rules(repo_path)?);
+    Ok(sources)
+}
 
 /// Read commits, format each as a one-paragraph entry. We include
 /// only commits with a substantive body (more than ~120 chars

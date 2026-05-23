@@ -14,7 +14,10 @@ pub mod lint;
 pub mod sweep;
 pub mod types;
 
-pub use bootstrap::{Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome};
+pub use bootstrap::{
+    Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource, SourceCounts,
+    SourceKind, collect_sources,
+};
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
 };
