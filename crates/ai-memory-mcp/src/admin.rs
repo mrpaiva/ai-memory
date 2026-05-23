@@ -1,10 +1,15 @@
 //! Admin HTTP routes — state-touching operations invoked by the CLI
 //! over plain HTTP (not MCP). Currently exposes:
 //!
-//! - `POST /admin/bootstrap` — ingest a pre-collected source bundle
+//! - `POST /admin/bootstrap`    — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
-//! - `GET  /admin/status`    — lifetime counts + server data-dir info.
-//! - `GET  /admin/search?q=` — FTS5 hits against the wiki index.
+//! - `GET  /admin/status`       — lifetime counts + server data-dir info.
+//! - `GET  /admin/search?q=`    — FTS5 hits against the wiki index.
+//! - `POST /admin/reorg`        — retro-fit sessions to per-cwd projects.
+//! - `POST /admin/lint`         — run the M8 lint pass.
+//! - `POST /admin/forget-sweep` — run the M8 retention sweep.
+//! - `POST /admin/embed`        — backfill embeddings for latest pages.
+//! - `POST /admin/commit`       — stage + commit the wiki tree via git.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -15,10 +20,12 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use ai_memory_consolidate::{
-    Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource, SourceCounts,
+    Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource, SourceCounts, run_lint,
+    run_sweep,
 };
-use ai_memory_llm::LlmProvider;
-use ai_memory_store::{ReaderPool, WriterHandle};
+use ai_memory_core::{ProjectId, SessionId, WorkspaceId};
+use ai_memory_llm::{Embedder, LlmProvider};
+use ai_memory_store::{DecayParams, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes};
 use ai_memory_wiki::Wiki;
 use axum::Json;
 use axum::Router;
@@ -27,6 +34,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -39,6 +47,10 @@ pub struct AdminState {
     pub wiki: Wiki,
     /// Optional LLM provider. When `None`, bootstrap returns 503.
     pub llm: Option<Arc<dyn LlmProvider>>,
+    /// Optional embedder. When `None`, `/admin/embed` returns 503.
+    pub embedder: Option<Arc<dyn Embedder>>,
+    /// Retention-decay parameters forwarded from server config.
+    pub decay_params: DecayParams,
     /// Server's resolved data directory (e.g. `/data` in the docker
     /// image). Surfaced via `/admin/status` so the CLI can report
     /// "where the wiki + db actually live".
@@ -77,11 +89,21 @@ fn default_max_input_tokens() -> usize {
 /// - `POST /admin/bootstrap`
 /// - `GET  /admin/status`
 /// - `GET  /admin/search`
+/// - `POST /admin/reorg`
+/// - `POST /admin/lint`
+/// - `POST /admin/forget-sweep`
+/// - `POST /admin/embed`
+/// - `POST /admin/commit`
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/status", get(handle_status))
         .route("/admin/search", get(handle_search))
+        .route("/admin/reorg", post(handle_reorg))
+        .route("/admin/lint", post(handle_lint))
+        .route("/admin/forget-sweep", post(handle_forget_sweep))
+        .route("/admin/embed", post(handle_embed))
+        .route("/admin/commit", post(handle_commit))
         .with_state(Arc::new(state))
 }
 
@@ -306,4 +328,549 @@ fn dry_run_outcome(
         StatusCode::OK,
         Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
     )
+}
+
+// ---------------------------------------------------------------------
+// reorg
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/reorg`.
+#[derive(Deserialize)]
+struct ReorgRequest {
+    /// Show what would change without writing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// One entry in the reorg plan (serialised in the response).
+#[derive(Debug, Serialize)]
+pub struct ReorgPlanEntry {
+    /// Session UUID string.
+    pub session_id: String,
+    /// Working directory the session was started in.
+    pub cwd: String,
+    /// Basename-derived project name the session will move to.
+    pub new_project: String,
+}
+
+/// Summary counts returned alongside the plan.
+#[derive(Debug, Serialize)]
+pub struct ReorgSummaryJson {
+    /// Sessions whose `project_id` was changed.
+    pub sessions_moved: usize,
+    /// Observations updated to match their session's new project.
+    pub observations_updated: usize,
+    /// `is_latest=1` pages marked `is_latest=0` (mash-up graveyard).
+    pub pages_graveyarded: usize,
+    /// Number of distinct per-cwd projects referenced in the plan.
+    pub distinct_new_projects: usize,
+}
+
+/// Full response for `POST /admin/reorg`.
+#[derive(Debug, Serialize)]
+pub struct ReorgReport {
+    /// `true` when `dry_run` was requested.
+    pub dry_run: bool,
+    /// All sessions that need (or needed) moving, with their target project.
+    pub plan: Vec<ReorgPlanEntry>,
+    /// Counts after execution (zeros when `dry_run=true`).
+    pub summary: ReorgSummaryJson,
+}
+
+async fn handle_reorg(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ReorgRequest>,
+) -> impl IntoResponse {
+    // Step 1: ensure the default workspace exists.
+    let ws = match state.writer.get_or_create_workspace("default").await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+
+    // Step 2: read all sessions with a non-NULL, non-empty cwd.
+    let sessions_with_cwd: Vec<(SessionId, ProjectId, String)> = match state
+        .reader
+        .with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, cwd \
+                     FROM sessions \
+                     WHERE cwd IS NOT NULL AND cwd != '' \
+                     ORDER BY started_at",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let proj_bytes: Vec<u8> = row.get(1)?;
+                let cwd: String = row.get(2)?;
+                Ok((id_bytes, proj_bytes, cwd))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (id_bytes, proj_bytes, cwd) = r?;
+                let sid = SessionId::from_slice(&id_bytes).map_err(StoreError::Memory)?;
+                let pid = ProjectId::from_slice(&proj_bytes).map_err(StoreError::Memory)?;
+                out.push((sid, pid, cwd));
+            }
+            Ok(out)
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    if sessions_with_cwd.is_empty() {
+        let report = ReorgReport {
+            dry_run: req.dry_run,
+            plan: Vec::new(),
+            summary: ReorgSummaryJson {
+                sessions_moved: 0,
+                observations_updated: 0,
+                pages_graveyarded: 0,
+                distinct_new_projects: 0,
+            },
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    // Step 3: resolve target project per distinct cwd (basename-derived).
+    let mut cwd_to_proj: std::collections::HashMap<String, (WorkspaceId, ProjectId, String)> =
+        std::collections::HashMap::new();
+    for (_, _, cwd) in &sessions_with_cwd {
+        if cwd_to_proj.contains_key(cwd.as_str()) {
+            continue;
+        }
+        let project_name = std::path::Path::new(cwd.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        let proj = match state
+            .writer
+            .get_or_create_project(ws, project_name.clone(), Some(cwd.clone()))
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("project: {e}") })),
+                );
+            }
+        };
+        cwd_to_proj.insert(cwd.clone(), (ws, proj, project_name));
+    }
+
+    // Step 4: build plan — sessions whose project_id already matches are skipped.
+    let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
+    let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
+    for (session_id, old_project_id, cwd) in &sessions_with_cwd {
+        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
+        if *new_project_id == *old_project_id {
+            continue;
+        }
+        plan_entries.push(ReorgPlanEntry {
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            new_project: project_name.clone(),
+        });
+        writer_plan.push((*session_id, *new_project_id));
+    }
+
+    let distinct_new_projects: std::collections::HashSet<ProjectId> =
+        writer_plan.iter().map(|(_, pid)| *pid).collect();
+
+    // Step 5: dry-run → return the plan without writing.
+    if req.dry_run || writer_plan.is_empty() {
+        let report = ReorgReport {
+            dry_run: req.dry_run,
+            plan: plan_entries,
+            summary: ReorgSummaryJson {
+                sessions_moved: 0,
+                observations_updated: 0,
+                pages_graveyarded: 0,
+                distinct_new_projects: distinct_new_projects.len(),
+            },
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        );
+    }
+
+    // Step 6: execute.
+    let summary = match state.writer.reorg_sessions(writer_plan).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let report = ReorgReport {
+        dry_run: false,
+        plan: plan_entries,
+        summary: ReorgSummaryJson {
+            sessions_moved: summary.sessions_moved,
+            observations_updated: summary.observations_updated,
+            pages_graveyarded: summary.pages_graveyarded,
+            distinct_new_projects: distinct_new_projects.len(),
+        },
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// lint
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/lint`.
+#[derive(Deserialize)]
+struct LintRequest {
+    /// Workspace name (auto-created if absent).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (auto-created if absent).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Don't write the lint report page.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_workspace() -> String {
+    "default".to_string()
+}
+
+fn default_project() -> String {
+    "scratch".to_string()
+}
+
+async fn handle_lint(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<LintRequest>,
+) -> impl IntoResponse {
+    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+    let proj = match state
+        .writer
+        .get_or_create_project(ws, req.project, None)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("project: {e}") })),
+            );
+        }
+    };
+
+    match run_lint(
+        &state.reader,
+        &state.wiki,
+        state.llm.as_ref(),
+        ws,
+        proj,
+        req.dry_run,
+    )
+    .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// forget-sweep
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/forget-sweep`.
+#[derive(Deserialize)]
+struct ForgetSweepRequest {
+    /// Workspace name (auto-created if absent).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (auto-created if absent).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Report what would be evicted without actually mutating.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn handle_forget_sweep(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ForgetSweepRequest>,
+) -> impl IntoResponse {
+    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+    let proj = match state
+        .writer
+        .get_or_create_project(ws, req.project, None)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("project: {e}") })),
+            );
+        }
+    };
+
+    match run_sweep(
+        &state.reader,
+        &state.writer,
+        ws,
+        proj,
+        &state.decay_params,
+        req.dry_run,
+    )
+    .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// embed
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/embed`.
+#[derive(Deserialize)]
+struct EmbedRequest {
+    /// Workspace name (auto-created if absent).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (auto-created if absent).
+    #[serde(default = "default_project")]
+    project: String,
+    /// When true, regenerates embeddings even for pages that already
+    /// have one matching the current (provider, model, dim).
+    #[serde(default)]
+    reembed: bool,
+}
+
+/// Summary response from `POST /admin/embed`.
+#[derive(Debug, Serialize)]
+pub struct EmbedReport {
+    /// Total pages that were embedded (or would be, in dry-run mode).
+    pub embedded: usize,
+    /// Pages skipped because a matching embedding already existed.
+    pub skipped: usize,
+    /// Pages that failed to embed (read error or provider error).
+    pub failed: usize,
+    /// Provider name.
+    pub provider: String,
+    /// Model identifier.
+    pub model: String,
+    /// Embedding dimensionality.
+    pub dim: u32,
+}
+
+async fn handle_embed(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<EmbedRequest>,
+) -> impl IntoResponse {
+    let embedder = match state.embedder.clone() {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "embedder not configured on server"
+                })),
+            );
+        }
+    };
+
+    let provider = embedder.provider().to_string();
+    let model = embedder.model().to_string();
+    let dim = embedder.dim();
+
+    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+    let proj = match state
+        .writer
+        .get_or_create_project(ws, req.project, None)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("project: {e}") })),
+            );
+        }
+    };
+
+    let candidates = match state.reader.decay_candidates(ws, proj).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    // Build the set of page ids that already have a matching embedding.
+    let already: std::collections::HashSet<_> = if req.reembed {
+        std::collections::HashSet::new()
+    } else {
+        match state
+            .reader
+            .load_embeddings(ws, proj, provider.clone(), model.clone(), dim)
+            .await
+        {
+            Ok(embeddings) => embeddings.into_iter().map(|s| s.id).collect(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                );
+            }
+        }
+    };
+
+    let mut embedded = 0_usize;
+    let mut skipped = 0_usize;
+    let mut failed = 0_usize;
+
+    for cand in candidates {
+        if !req.reembed && already.contains(&cand.id) {
+            skipped += 1;
+            continue;
+        }
+        let md = match state.wiki.read_page(&cand.path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
+                failed += 1;
+                continue;
+            }
+        };
+        let vec = match embedder.embed(&md.body).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: provider call failed");
+                failed += 1;
+                continue;
+            }
+        };
+        let bytes = f32_vec_to_bytes(&vec);
+        if let Err(e) = state
+            .writer
+            .store_embedding(cand.id, bytes, provider.clone(), model.clone(), dim)
+            .await
+        {
+            warn!(path = %cand.path, error = %e, "embed: store_embedding failed");
+            failed += 1;
+            continue;
+        }
+        embedded += 1;
+    }
+
+    let report = EmbedReport {
+        embedded,
+        skipped,
+        failed,
+        provider,
+        model,
+        dim,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// commit
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/commit`.
+#[derive(Deserialize)]
+struct CommitRequest {
+    /// Commit message.
+    message: String,
+}
+
+async fn handle_commit(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CommitRequest>,
+) -> impl IntoResponse {
+    match state.wiki.commit_all(&req.message) {
+        Ok(Some(oid)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "committed": true,
+                "oid": oid.to_string(),
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "committed": false,
+                "reason": "nothing to commit",
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
 }

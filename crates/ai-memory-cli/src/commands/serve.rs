@@ -180,6 +180,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 reader: store.reader.clone(),
                 wiki: wiki.clone(),
                 llm: admin_llm,
+                embedder: embedder.clone(),
+                decay_params: config.decay,
                 data_dir: config.data_dir.clone(),
                 db_path: store.db_path().to_path_buf(),
                 bind: bind.clone(),

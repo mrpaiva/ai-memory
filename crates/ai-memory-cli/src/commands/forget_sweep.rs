@@ -1,31 +1,35 @@
-//! `ai-memory forget-sweep` — run the M8 retention sweep manually.
+//! `ai-memory forget-sweep` — thin HTTP client for the M8 retention sweep.
 
-use ai_memory_consolidate::run_sweep;
-use ai_memory_store::Store;
-use anyhow::{Context, Result};
+use anyhow::Result;
+use serde::Serialize;
 
 use crate::cli::ForgetSweepArgs;
 use crate::config::Config;
+use crate::http_client::{ServerEndpoint, post_json};
+
+/// Request sent to `POST /admin/forget-sweep`.
+#[derive(Serialize)]
+struct ForgetSweepRequest {
+    workspace: String,
+    project: String,
+    dry_run: bool,
+}
 
 /// Run the `forget-sweep` subcommand.
 ///
 /// # Errors
-/// Returns an error if the store cannot be opened or the sweep fails.
-pub async fn run(config: &Config, args: ForgetSweepArgs) -> Result<()> {
-    let store = Store::open(&config.data_dir)
-        .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
-    let ws = store.writer.get_or_create_workspace("default").await?;
-    let proj = store
-        .writer
-        .get_or_create_project(ws, "scratch", None)
-        .await?;
-    let report = run_sweep(
-        &store.reader,
-        &store.writer,
-        ws,
-        proj,
-        &config.decay,
-        args.dry_run,
+/// Returns an error if the server is unreachable or returns a non-2xx
+/// response.
+pub async fn run(_config: &Config, args: ForgetSweepArgs) -> Result<()> {
+    let endpoint = ServerEndpoint::from_env();
+    let report: serde_json::Value = post_json(
+        &endpoint,
+        "/admin/forget-sweep",
+        &ForgetSweepRequest {
+            workspace: "default".to_string(),
+            project: "scratch".to_string(),
+            dry_run: args.dry_run,
+        },
     )
     .await?;
     println!("{}", serde_json::to_string_pretty(&report)?);

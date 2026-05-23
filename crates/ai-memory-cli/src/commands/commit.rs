@@ -1,23 +1,53 @@
-//! `ai-memory commit` — manual wiki git commit.
+//! `ai-memory commit` — thin HTTP client for the manual wiki git commit.
 
-use ai_memory_store::Store;
-use ai_memory_wiki::Wiki;
-use anyhow::{Context, Result};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::CommitArgs;
 use crate::config::Config;
+use crate::http_client::{ServerEndpoint, post_json};
+
+/// Request sent to `POST /admin/commit`.
+#[derive(Serialize)]
+struct CommitRequest {
+    message: String,
+}
+
+/// Response from `POST /admin/commit`.
+#[derive(Deserialize)]
+struct CommitResponse {
+    committed: bool,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
 
 /// Run the `commit` subcommand.
 ///
 /// # Errors
-/// Returns an error if the wiki/git layer fails.
-pub fn run(config: &Config, args: CommitArgs) -> Result<()> {
-    let store = Store::open(&config.data_dir)
-        .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
-    let wiki = Wiki::new(&config.data_dir, store.writer.clone())?;
-    match wiki.commit_all(&args.message)? {
-        Some(oid) => println!("committed: {oid}"),
-        None => println!("nothing to commit (working tree clean)"),
+/// Returns an error if the server is unreachable or returns a non-2xx
+/// response.
+pub async fn run(_config: &Config, args: CommitArgs) -> Result<()> {
+    let endpoint = ServerEndpoint::from_env();
+    let resp: CommitResponse = post_json(
+        &endpoint,
+        "/admin/commit",
+        &CommitRequest {
+            message: args.message,
+        },
+    )
+    .await?;
+    if resp.committed {
+        println!("committed: {}", resp.oid.as_deref().unwrap_or("(unknown)"));
+    } else {
+        println!(
+            "nothing to commit{}",
+            resp.reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
+        );
     }
     Ok(())
 }

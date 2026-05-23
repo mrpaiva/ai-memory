@@ -6,7 +6,7 @@
 
 use ai_memory_core::{NewPage, PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::Store;
+use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,6 +22,8 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         reader: store.reader.clone(),
         wiki,
         llm: None,
+        embedder: None,
+        decay_params: DecayParams::default(),
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:49374".to_string(),
