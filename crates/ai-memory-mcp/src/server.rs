@@ -137,6 +137,26 @@ struct HandoffAcceptArgs {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BriefingArgs {
+    /// How many recently-updated pages to include (default 10, max 100).
+    #[serde(default)]
+    recent_pages_limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ExploreArgs {
+    /// Optional topic to bias the digest toward (e.g. "recent rules",
+    /// "pending handoffs", or a free-form question). When absent the
+    /// digest covers the project broadly.
+    #[serde(default)]
+    focus: Option<String>,
+    /// How many recently-updated pages the underlying briefing should
+    /// consider (default 10).
+    #[serde(default)]
+    recent_pages_limit: Option<usize>,
+}
+
 #[tool_router]
 impl AiMemoryServer {
     /// Construct a server backed by the given reader/writer + 3-tuple
@@ -475,6 +495,85 @@ impl AiMemoryServer {
         let response = StatusResponse { counts };
         ok_json(&response)
     }
+
+    /// Composite "what's going on" snapshot — structured data only,
+    /// no LLM call. Pair with `memory_explore` if you want prose.
+    #[tool(description = "Compose a structured snapshot of project activity \
+        WITHOUT any LLM call: lifetime counts, 7-day and 30-day activity \
+        windows, last-observation timestamp, pending handoff count, \
+        current `_rules/` pages, and recent-page list. Cheap, fast, \
+        deterministic. Use this when you want a programmatic view of \
+        project state; use `memory_explore` if you want an LLM-composed \
+        prose summary on top of the same data.")]
+    async fn memory_briefing(
+        &self,
+        Parameters(args): Parameters<BriefingArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args.recent_pages_limit.unwrap_or(10);
+        let snapshot = self
+            .reader
+            .briefing(limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&snapshot)
+    }
+
+    /// LLM-driven exploration. Calls `memory_briefing` internally, computes
+    /// the time gap since the last observation, then asks the configured
+    /// LLM to compose a calibrated prose digest (more detail for longer
+    /// gaps, less for short ones). Falls back to a friendly JSON dump if
+    /// no LLM is configured.
+    #[tool(description = "Compose a calibrated prose digest of project \
+        state. Calls `memory_briefing` for structured data, computes how \
+        long it's been since the last observation, then asks the LLM to \
+        scale verbosity to the gap (just-checked-in → 1-line, weeks-away \
+        → fuller catchup). Accepts an optional `focus` argument to bias \
+        the digest toward a topic (e.g. \"recent rules\" / \"pending \
+        handoffs\" / a free-form question). When no LLM is configured \
+        this returns the underlying briefing JSON unchanged so the \
+        caller can render its own prose.")]
+    async fn memory_explore(
+        &self,
+        Parameters(args): Parameters<ExploreArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args.recent_pages_limit.unwrap_or(10);
+        let snapshot = self
+            .reader
+            .briefing(limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let Some(llm) = &self.consolidator else {
+            // No LLM configured — return the structured snapshot.
+            // Caller can render prose itself if it wants.
+            return ok_json(&serde_json::json!({
+                "prose": null,
+                "reason": "no LLM provider configured; returning structured briefing instead",
+                "briefing": snapshot,
+            }));
+        };
+
+        let gap = explore_gap_from_snapshot(&snapshot);
+        let request = build_explore_request(&snapshot, &gap, args.focus.as_deref());
+        let provider = llm.llm();
+        let text = match provider.complete(request).await {
+            Ok(resp) => resp.text,
+            Err(e) => {
+                tracing::warn!(error = %e, "memory_explore LLM call failed; degrading to briefing");
+                return ok_json(&serde_json::json!({
+                    "prose": null,
+                    "reason": format!("LLM call failed: {e}"),
+                    "briefing": snapshot,
+                }));
+            }
+        };
+
+        ok_json(&serde_json::json!({
+            "prose": text,
+            "gap": gap,
+            "briefing": snapshot,
+        }))
+    }
 }
 
 #[tool_handler]
@@ -515,6 +614,149 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(s)]))
 }
+
+/// Description of how long it's been since the last observation.
+/// `memory_explore` uses this both to size its prompt verbosity and
+/// to give the LLM an explicit "time gap is N hours" cue.
+#[derive(Debug, Serialize)]
+struct ExploreGap {
+    /// Hours since the last observation, or `None` if nothing has
+    /// ever been observed for this project.
+    hours_since_last: Option<f64>,
+    /// Coarse bucket name used to drive the prompt:
+    /// `none` — no prior activity at all.
+    /// `fresh` — last observation < 1 h ago.
+    /// `today` — < 24 h ago.
+    /// `recent` — < 7 days ago.
+    /// `dormant` — < 30 days ago.
+    /// `stale` — > 30 days ago.
+    bucket: &'static str,
+    /// Plain-English description for the LLM prompt.
+    description: String,
+}
+
+fn explore_gap_from_snapshot(s: &ai_memory_store::BriefingSnapshot) -> ExploreGap {
+    let Some(last) = s.last_observation_at.as_deref() else {
+        return ExploreGap {
+            hours_since_last: None,
+            bucket: "none",
+            description: "no prior activity recorded for this project".into(),
+        };
+    };
+    let Ok(last_ts) = last.parse::<jiff::Timestamp>() else {
+        return ExploreGap {
+            hours_since_last: None,
+            bucket: "none",
+            description: format!("last observation timestamp unparseable: {last}"),
+        };
+    };
+    let delta_us = jiff::Timestamp::now().as_microsecond() - last_ts.as_microsecond();
+    let hours = (delta_us as f64) / 1_000_000.0 / 3600.0;
+    let (bucket, description) = if hours < 1.0 {
+        (
+            "fresh",
+            format!("{:.1} minutes since last observation", hours * 60.0),
+        )
+    } else if hours < 24.0 {
+        ("today", format!("{hours:.1} hours since last observation"))
+    } else if hours < 24.0 * 7.0 {
+        (
+            "recent",
+            format!("{:.1} days since last observation", hours / 24.0),
+        )
+    } else if hours < 24.0 * 30.0 {
+        (
+            "dormant",
+            format!("{:.1} days since last observation", hours / 24.0),
+        )
+    } else {
+        (
+            "stale",
+            format!("{:.1} days since last observation", hours / 24.0),
+        )
+    };
+    ExploreGap {
+        hours_since_last: Some(hours),
+        bucket,
+        description,
+    }
+}
+
+/// Build the ChatRequest for `memory_explore`. The user message
+/// inlines the entire briefing as JSON — small enough (a few KB) that
+/// model context is not a concern. The system prompt + the gap
+/// bucket together steer verbosity.
+fn build_explore_request(
+    snapshot: &ai_memory_store::BriefingSnapshot,
+    gap: &ExploreGap,
+    focus: Option<&str>,
+) -> ai_memory_llm::ChatRequest {
+    let snapshot_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".into());
+    let mut user = String::new();
+    user.push_str("## Project state snapshot\n\n");
+    user.push_str("```json\n");
+    user.push_str(&snapshot_json);
+    user.push_str("\n```\n\n");
+    user.push_str(&format!(
+        "## Time gap\n\nBucket: `{}` — {}.\n\n",
+        gap.bucket, gap.description
+    ));
+    if let Some(focus) = focus {
+        user.push_str("## Focus\n\nThe user is specifically interested in: ");
+        user.push_str(focus);
+        user.push_str("\n\nBias the digest toward this topic while still covering anything urgent (pending handoffs, recently-changed rules).\n");
+    }
+    ai_memory_llm::ChatRequest {
+        system: Some(EXPLORE_SYSTEM_PROMPT.into()),
+        messages: vec![ai_memory_llm::ChatMessage {
+            role: ai_memory_llm::Role::User,
+            content: user,
+        }],
+        max_tokens: 1500,
+        temperature: Some(0.2),
+    }
+}
+
+/// System prompt for `memory_explore`. Pure faithfulness rules
+/// (mirrors the consolidation system prompt's discipline) + explicit
+/// verbosity-vs-gap scaling.
+const EXPLORE_SYSTEM_PROMPT: &str = "\
+You are composing a digest of a software project's long-term memory \
+for a developer reorienting to the project. You receive a structured \
+snapshot (JSON) and a `time gap` bucket; your output is markdown \
+prose.\n\
+\n\
+## Verbosity scales with the gap\n\
+\n\
+- `fresh` (< 1 h ago) — one line. The developer was just here; \
+  reorient minimally. Example: \"Last touched X. No pending work.\"\n\
+- `today` (< 24 h) — 2-4 lines. What was last worked on; pending \
+  handoffs if any; nothing else.\n\
+- `recent` (< 7 days) — 1-2 paragraphs. Summary of what's changed; \
+  any new rules; pending handoffs; warnings.\n\
+- `dormant` (< 30 days) — 3-5 paragraphs. Fuller catchup: \
+  activity over the window, new rules with one-line explanations, \
+  pending handoffs spelled out, decay candidates if any.\n\
+- `stale` (> 30 days) — full briefing. Activity totals, every rule \
+  surfaced briefly, all pending handoffs, decay candidates, \
+  warnings about stale knowledge.\n\
+- `none` (no prior activity) — one paragraph saying so plus the \
+  current rule list (if any).\n\
+\n\
+## FAITHFULNESS\n\
+\n\
+Everything in your output MUST be grounded in the snapshot. Do not \
+invent dates, counts, or page titles. Do not invent rules or \
+warnings that aren't in the data. If the snapshot is empty (zero \
+counts, no recent_pages), say so plainly — do not pad with generic \
+advice.\n\
+\n\
+## Format\n\
+\n\
+Plain markdown. Use level-2 headers (`##`) only for the longer \
+buckets (`dormant`/`stale`). For `fresh`/`today`/`recent` skip \
+headers entirely. Quote rule titles from the snapshot with \
+backticks. Never wrap the whole response in code fences.";
 
 #[cfg(test)]
 mod tests {
@@ -588,6 +830,106 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("\"pages_latest\": 1"));
+    }
+
+    #[tokio::test]
+    async fn memory_briefing_returns_structured_snapshot() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let result = server
+            .memory_briefing(Parameters(BriefingArgs {
+                recent_pages_limit: Some(5),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        // Spot-check the structural shape — every key must be present
+        // so callers don't need to defensively handle missing fields.
+        for key in [
+            "\"counts\":",
+            "\"activity_7d\":",
+            "\"activity_30d\":",
+            "\"last_observation_at\":",
+            "\"pending_handoff_count\":",
+            "\"rules\":",
+            "\"recent_pages\":",
+        ] {
+            assert!(text.contains(key), "missing {key} in briefing:\n{text}");
+        }
+        // setup_server inserts one page, no sessions/observations,
+        // no rules. The activity windows therefore observe zero.
+        assert!(
+            text.contains("\"sessions\": 0"),
+            "expected lifetime sessions: 0\n{text}"
+        );
+    }
+
+    /// `memory_explore` without an LLM provider configured must
+    /// degrade to returning the underlying briefing rather than
+    /// erroring. Mirrors the behaviour of `memory_consolidate`
+    /// (no provider → clean error/no-op), and matches the design
+    /// invariant that LLM features are strictly opt-in.
+    #[tokio::test]
+    async fn memory_explore_without_llm_degrades_to_briefing() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let result = server
+            .memory_explore(Parameters(ExploreArgs {
+                focus: None,
+                recent_pages_limit: Some(5),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("\"prose\": null"),
+            "expected null prose\n{text}"
+        );
+        assert!(
+            text.contains("no LLM provider configured"),
+            "expected fallback reason\n{text}"
+        );
+        assert!(
+            text.contains("\"briefing\":"),
+            "expected briefing payload\n{text}"
+        );
+    }
+
+    #[test]
+    fn explore_gap_bucket_picks_right_label() {
+        use ai_memory_store::BriefingSnapshot;
+        // No prior activity → `none`.
+        let snap = BriefingSnapshot::default();
+        let gap = explore_gap_from_snapshot(&snap);
+        assert_eq!(gap.bucket, "none");
+        assert!(gap.hours_since_last.is_none());
+
+        // Helper: build a snapshot with last_observation_at N hours ago.
+        let snap_at = |hours: i64| -> BriefingSnapshot {
+            let ts = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(hours);
+            BriefingSnapshot {
+                last_observation_at: Some(ts.to_string()),
+                ..Default::default()
+            }
+        };
+
+        let cases = [(2, "today"), (24 * 10, "dormant"), (24 * 60, "stale")];
+        for (hours, expected) in cases {
+            let g = explore_gap_from_snapshot(&snap_at(hours));
+            assert_eq!(
+                g.bucket, expected,
+                "{hours}h → {expected}, got {}",
+                g.bucket
+            );
+        }
     }
 
     #[tokio::test]

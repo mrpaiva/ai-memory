@@ -22,7 +22,8 @@ mod writer;
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use reader::{
-    DecayCandidate, PageHit, ReaderPool, StatusCounts, StoredEmbedding, f32_vec_to_bytes,
+    ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, PageHit, ReaderPool,
+    StatusCounts, StoredEmbedding, f32_vec_to_bytes,
 };
 pub use writer::WriterHandle;
 

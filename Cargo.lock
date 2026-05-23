@@ -168,6 +168,7 @@ dependencies = [
  "ai-memory-wiki",
  "anyhow",
  "axum",
+ "jiff",
  "rmcp",
  "schemars",
  "serde",

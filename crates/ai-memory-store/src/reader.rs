@@ -51,6 +51,63 @@ pub struct StatusCounts {
     pub observations: u64,
 }
 
+/// Rolling activity counters over a fixed time window. Surfaced by
+/// [`ReaderPool::briefing`] so the caller (or an LLM-driven `memory_explore`)
+/// can calibrate verbosity against how busy the project's been.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ActivityWindow {
+    /// Window size in days (e.g. 7 or 30).
+    pub days: u32,
+    /// Sessions whose `created_at` falls in the window.
+    pub sessions: u64,
+    /// Observations whose `created_at` falls in the window.
+    pub observations: u64,
+    /// Pages whose `updated_at` falls in the window — counts only
+    /// `is_latest = 1`. Supersession of an old version into a new one
+    /// counts as one update (the new row).
+    pub pages_updated: u64,
+}
+
+/// Snapshot used by `memory_briefing` and the LLM-driven
+/// `memory_explore`. Pure SQL aggregation; no LLM, no schema reads
+/// outside the existing `pages` / `sessions` / `observations` /
+/// `handoffs` tables.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BriefingSnapshot {
+    /// Lifetime totals — same shape `memory_status` returns today.
+    pub counts: StatusCounts,
+    /// Activity over the last 7 days.
+    pub activity_7d: ActivityWindow,
+    /// Activity over the last 30 days.
+    pub activity_30d: ActivityWindow,
+    /// Timestamp of the most recent observation (ISO-8601), or `null`
+    /// if no observations exist. The `now - last_observation_at` gap
+    /// is the signal `memory_explore` uses to scale its verbosity.
+    pub last_observation_at: Option<String>,
+    /// Number of open (un-accepted) handoffs.
+    pub pending_handoff_count: u64,
+    /// All pages currently under `_rules/` — small, surfaced verbatim
+    /// because they're the highest-signal type of memory.
+    pub rules: Vec<BriefingPage>,
+    /// Top-N most-recently-updated `is_latest = 1` pages.
+    pub recent_pages: Vec<BriefingPage>,
+}
+
+/// Trimmed page view for the briefing — path, title, kind, updated_at
+/// timestamp. Body and snippets are intentionally omitted (the caller
+/// can follow up with `memory_query` if they need detail).
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefingPage {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title (first H1 / frontmatter title).
+    pub title: String,
+    /// Semantic classification — `decision` / `gotcha` / `rule` / `fact`.
+    pub kind: String,
+    /// ISO-8601 timestamp of the last update.
+    pub updated_at: String,
+}
+
 /// Cheap, cloneable read-only connection pool handle.
 #[derive(Clone)]
 pub struct ReaderPool {
@@ -526,6 +583,93 @@ impl ReaderPool {
         .await
     }
 
+    /// Assemble a [`BriefingSnapshot`] — pure SQL aggregation across
+    /// the `pages` / `sessions` / `observations` / `handoffs` tables.
+    /// No LLM, no schema reads outside what's already there.
+    ///
+    /// `recent_pages_limit` caps the `recent_pages` array; pass a
+    /// small number (5-20) — this is meant to be skimmed, not paged
+    /// through.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    #[allow(clippy::too_many_lines)]
+    pub async fn briefing(&self, recent_pages_limit: usize) -> StoreResult<BriefingSnapshot> {
+        let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        self.with_conn(move |conn| {
+            let now_us = jiff::Timestamp::now().as_microsecond();
+            let day_us: i64 = 86_400 * 1_000_000;
+            let cutoff_7d = now_us - 7 * day_us;
+            let cutoff_30d = now_us - 30 * day_us;
+
+            let counts = StatusCounts {
+                pages_latest: count(conn, "SELECT COUNT(*) FROM pages WHERE is_latest = 1")?,
+                pages_all: count(conn, "SELECT COUNT(*) FROM pages")?,
+                sessions: count(conn, "SELECT COUNT(*) FROM sessions")?,
+                observations: count(conn, "SELECT COUNT(*) FROM observations")?,
+            };
+
+            let activity_7d = window_activity(conn, 7, cutoff_7d)?;
+            let activity_30d = window_activity(conn, 30, cutoff_30d)?;
+
+            let last_observation_at: Option<i64> = conn
+                .query_row("SELECT MAX(created_at) FROM observations", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .optional()?
+                .flatten();
+            let last_observation_at = last_observation_at
+                .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                .map(|ts| ts.to_string());
+
+            let pending_handoff_count: u64 =
+                count(conn, "SELECT COUNT(*) FROM handoffs WHERE state = 'open'")?;
+
+            // Rules: any `is_latest = 1` page under `_rules/`.
+            // Routed there automatically by the consolidator when
+            // `kind = "rule"` — see consolidator.rs::slugify_for_rule.
+            let mut rules_stmt = conn.prepare(
+                "SELECT path, title, \
+                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE is_latest = 1 AND path LIKE '_rules/%' \
+                 ORDER BY updated_at DESC",
+            )?;
+            let rules: Vec<BriefingPage> = rules_stmt
+                .query_map([], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut recent_stmt = conn.prepare(
+                "SELECT path, title, \
+                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE is_latest = 1 \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?1",
+            )?;
+            let recent_pages: Vec<BriefingPage> = recent_stmt
+                .query_map(params![recent_limit], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(BriefingSnapshot {
+                counts,
+                activity_7d,
+                activity_30d,
+                last_observation_at,
+                pending_handoff_count,
+                rules,
+                recent_pages,
+            })
+        })
+        .await
+    }
+
     /// Return aggregate counts for the `status` view.
     ///
     /// # Errors
@@ -826,6 +970,50 @@ fn parse_agent(s: &str) -> AgentKind {
 fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {
     let n: Option<i64> = conn.query_row(sql, [], |row| row.get(0)).optional()?;
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
+/// Count rows in a time-bounded window. Used by [`ReaderPool::briefing`]
+/// to compute "last 7 days" / "last 30 days" activity slices.
+fn window_activity(conn: &Connection, days: u32, cutoff_us: i64) -> StoreResult<ActivityWindow> {
+    let count_since = |sql: &str| -> StoreResult<u64> {
+        let n: Option<i64> = conn
+            .query_row(sql, params![cutoff_us], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+    Ok(ActivityWindow {
+        days,
+        // `sessions` schema uses `started_at`, not `created_at` — easy
+        // to forget because the other tables all use `created_at`.
+        sessions: count_since("SELECT COUNT(*) FROM sessions WHERE started_at > ?1")?,
+        observations: count_since("SELECT COUNT(*) FROM observations WHERE created_at > ?1")?,
+        pages_updated: count_since(
+            "SELECT COUNT(*) FROM pages WHERE is_latest = 1 AND updated_at > ?1",
+        )?,
+    })
+}
+
+/// Materialise one row from the briefing's recent-pages / rules queries
+/// into a [`BriefingPage`]. The row shape is `(path, title, kind,
+/// updated_at_us)` — all queries above MUST select those columns in
+/// that order.
+fn briefing_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<BriefingPage>> {
+    let path: String = row.get(0)?;
+    let title: String = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let updated_us: i64 = row.get(3)?;
+    Ok(jiff::Timestamp::from_microsecond(updated_us)
+        .map(|ts| BriefingPage {
+            path,
+            title,
+            kind,
+            updated_at: ts.to_string(),
+        })
+        .map_err(|e| {
+            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                "bad updated_at: {e}"
+            )))
+        }))
 }
 
 fn checkout(inner: &Inner) -> StoreResult<Connection> {

@@ -184,6 +184,15 @@ impl Consolidator {
         &self.writer
     }
 
+    /// Borrow the underlying LLM provider. Used by lightweight LLM
+    /// callers (`memory_explore`) that want to issue a one-shot
+    /// completion without going through the full consolidate
+    /// pipeline.
+    #[must_use]
+    pub fn llm(&self) -> Arc<dyn ai_memory_llm::LlmProvider> {
+        self.llm.clone()
+    }
+
     /// M7b multi-page consolidation: ask the LLM for a batch of page
     /// updates spanning sessions/, concepts/, decisions/, then write
     /// them all atomically (one SQL transaction).

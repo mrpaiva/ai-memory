@@ -14,6 +14,11 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY crates ./crates
+# `evals/` is a workspace member (off-tree A/B harness, not shipped
+# in the image — but Cargo refuses to parse the workspace manifest
+# if a declared member doesn't exist on disk). Copy the dir so the
+# manifest resolves; `-p ai-memory-cli` keeps the binary build narrow.
+COPY evals ./evals
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
     cargo build --release -p ai-memory-cli \
