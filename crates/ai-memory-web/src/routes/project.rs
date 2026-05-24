@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::Html;
 
 use crate::state::WebState;
-use crate::templates::{Folder, PageRow, ProjectView, humanize};
+use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
@@ -40,6 +40,7 @@ pub(crate) async fn handler(
             .unwrap_or_else(|| "(root)".to_owned());
         folder_map.entry(folder).or_default().push(PageRow {
             path: p.path.clone(),
+            href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
             kind: p.kind.clone(),
             updated_relative: humanize(&p.updated_at),
@@ -58,6 +59,7 @@ pub(crate) async fn handler(
         .into_iter()
         .map(|p| PageRow {
             path: p.path.clone(),
+            href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
             kind: p.kind.clone(),
             updated_relative: humanize(&p.updated_at),

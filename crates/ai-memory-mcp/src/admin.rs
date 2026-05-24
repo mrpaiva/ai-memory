@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use std::io::Seek;
 use std::path::PathBuf;
 
 use ai_memory_consolidate::{
@@ -184,10 +185,9 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         .await
         .map_err(|e| anyhow::anyhow!("sqlite snapshot: {e}"))?;
 
-    let mut tar_file = tempfile::NamedTempFile::new()?;
-    let tar_path = tar_file.path().to_path_buf();
+    let mut tar_file = tempfile::tempfile()?;
     {
-        let encoder = GzEncoder::new(tar_file.as_file_mut(), Compression::default());
+        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
         let mut tar = tar::Builder::new(encoder);
         tar.mode(tar::HeaderMode::Deterministic);
 
@@ -209,11 +209,9 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         let encoder = tar.into_inner()?;
         encoder.finish()?;
     }
-    tar_file.as_file_mut().sync_data()?;
-    let file = tokio::fs::File::open(&tar_path).await?;
-    drop(tar_file);
-    let _ = std::fs::remove_file(&tar_path);
-    Ok(file)
+    tar_file.sync_data()?;
+    tar_file.rewind()?;
+    Ok(tokio::fs::File::from_std(tar_file))
 }
 
 // ---------------------------------------------------------------------

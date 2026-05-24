@@ -3,6 +3,53 @@
 use askama::Template;
 
 // ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `/web` project URL with path segments percent-encoded.
+#[must_use]
+pub(crate) fn project_href(workspace: &str, project: &str) -> String {
+    format!(
+        "/web/w/{}/{}",
+        encode_segment(workspace),
+        encode_segment(project)
+    )
+}
+
+/// Build a `/web` page URL with workspace/project/path percent-encoded.
+#[must_use]
+pub(crate) fn page_href(workspace: &str, project: &str, path: &str) -> String {
+    format!(
+        "{}/p/{}",
+        project_href(workspace, project),
+        encode_path(path)
+    )
+}
+
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Humanise helper
 // ---------------------------------------------------------------------------
 
@@ -75,6 +122,8 @@ pub(crate) struct ProjectsView {
 pub(crate) struct PageRow {
     /// Relative wiki path.
     pub path: String,
+    /// Link target for this page.
+    pub href: String,
     /// Page title.
     pub title: String,
     /// Semantic kind badge text.
@@ -117,6 +166,8 @@ pub(crate) struct PageView {
     pub workspace: String,
     /// Project name.
     pub project: String,
+    /// Link target for the containing project.
+    pub project_href: String,
     /// Relative wiki path.
     pub path: String,
     /// Page title.
@@ -133,6 +184,8 @@ pub(crate) struct PageView {
     pub created_relative: String,
     /// Path of the page this supersedes, or empty string.
     pub supersedes_path: String,
+    /// Link target for the superseded page, or empty string.
+    pub supersedes_href: String,
     /// Rendered markdown body (HTML, trusted).
     pub body_html: String,
 }
@@ -149,6 +202,8 @@ pub(crate) struct SearchHit {
     pub project: String,
     /// Relative wiki path.
     pub path: String,
+    /// Link target for this hit.
+    pub href: String,
     /// Page title.
     pub title: String,
     /// FTS5 snippet (HTML-marked with `<mark>` tags).
@@ -175,3 +230,20 @@ pub(crate) struct SearchView {
 #[derive(Template)]
 #[template(path = "not_found.html")]
 pub(crate) struct NotFoundView {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn href_helpers_percent_encode_segments() {
+        assert_eq!(
+            project_href("default space", "proj#one"),
+            "/web/w/default%20space/proj%23one"
+        );
+        assert_eq!(
+            page_href("default", "scratch", "notes/a b%25.md"),
+            "/web/w/default/scratch/p/notes/a%20b%2525.md"
+        );
+    }
+}

@@ -27,7 +27,7 @@
         <ul class="space-y-0.5 pl-2">
           {% for page in folder.pages %}
           <li>
-            <a href="/web/w/{{ workspace }}/{{ project }}/p/{{ page.path }}"
+            <a href="{{ page.href }}"
                class="block truncate text-sm text-slate-700 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 py-0.5">
               {{ page.title }}
             </a>
@@ -50,7 +50,7 @@
       {% for page in recent %}
       <li class="py-3 flex items-start justify-between gap-4">
         <div class="min-w-0">
-          <a href="/web/w/{{ workspace }}/{{ project }}/p/{{ page.path }}"
+          <a href="{{ page.href }}"
              class="text-sm font-medium text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 truncate block">
             {{ page.title }}
           </a>

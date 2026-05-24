@@ -49,9 +49,9 @@ pub struct Config {
     /// `AI_MEMORY_AUTH_TOKEN` env var or `[auth].bearer_token` in
     /// config.toml.
     pub auth: AuthSettings,
-    /// `Host`-header allowlist for the MCP transport. rmcp's
-    /// `StreamableHttpService` rejects any inbound request whose
-    /// `Host` header doesn't match this list (DNS-rebinding defence).
+    /// `Host`-header allowlist for the HTTP server. Requests whose
+    /// `Host` header doesn't match this list are rejected before they
+    /// reach MCP, hook, admin, or web routes (DNS-rebinding defence).
     /// Default is loopback only; to expose ai-memory on a LAN
     /// IP / `home.lan` / etc., add that authority here or pass it via
     /// `AI_MEMORY_ALLOWED_HOSTS=host1,host2,…` at startup.

@@ -10,7 +10,7 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::markdown;
 use crate::state::WebState;
-use crate::templates::{NotFoundView, PageView, humanize};
+use crate::templates::{NotFoundView, PageView, humanize, page_href, project_href};
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
@@ -40,9 +40,18 @@ pub(crate) async fn handler(
     // in its header, so leaving it in the body duplicates it.
     let body_html = markdown::render(markdown::strip_leading_h1(&markdown_doc.body));
 
+    let project_href = project_href(&workspace, &project);
+    let supersedes_path = meta.supersedes.unwrap_or_default();
+    let supersedes_href = if supersedes_path.is_empty() {
+        String::new()
+    } else {
+        page_href(&workspace, &project, &supersedes_path)
+    };
+
     match (PageView {
         workspace,
         project,
+        project_href,
         path: meta.path,
         title: meta.title,
         kind: meta.kind,
@@ -50,7 +59,8 @@ pub(crate) async fn handler(
         pinned: meta.pinned,
         updated_relative: humanize(&meta.updated_at),
         created_relative: humanize(&meta.created_at),
-        supersedes_path: meta.supersedes.unwrap_or_default(),
+        supersedes_path,
+        supersedes_href,
         body_html,
     }
     .render())

@@ -35,7 +35,7 @@
 <ul class="divide-y divide-slate-100 dark:divide-slate-800">
   {% for hit in hits %}
   <li class="py-4">
-    <a href="/web/w/{{ hit.workspace }}/{{ hit.project }}/p/{{ hit.path }}"
+    <a href="{{ hit.href }}"
        class="text-base font-medium text-blue-700 dark:text-blue-400 hover:underline block mb-1">
       {{ hit.title }}
     </a>

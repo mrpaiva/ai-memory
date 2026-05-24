@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::markdown;
 use crate::state::WebState;
-use crate::templates::{SearchHit, SearchView};
+use crate::templates::{SearchHit, SearchView, page_href};
 
 /// Query-string parameters for the search endpoint.
 #[derive(Debug, Deserialize)]
@@ -36,22 +36,19 @@ pub(crate) async fn handler(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // For each hit we need (workspace, project) — look up via a second
-        // query per hit is too expensive; instead query the page_meta inline.
-        // Since search_pages returns PageHit with workspace/project not yet
-        // separated, we query page_meta by path using the "default" workspace
-        // for now. The proper approach joins workspaces/projects in the FTS
-        // query; for v1 we accept the extra lookup.
+        // Search hits carry only the page id/path/title/snippet. Resolve
+        // workspace + project by page id so duplicate paths in sibling
+        // projects still link to the right page.
         let mut results = Vec::with_capacity(raw.len());
         for h in raw {
-            // Get workspace + project by looking up full meta.
-            // We try across all project/workspace combos by using the raw
-            // search hit's path and calling a lightweight query.
             if let Ok(Some(m)) = state.reader.page_meta_by_id(h.id).await {
+                let path = h.path.as_str().to_owned();
+                let href = page_href(&m.workspace_name, &m.project_name, &path);
                 results.push(SearchHit {
                     workspace: m.workspace_name,
                     project: m.project_name,
-                    path: h.path.as_str().to_owned(),
+                    path,
+                    href,
                     title: h.title,
                     snippet: markdown::escape_snippet(&h.snippet),
                 });

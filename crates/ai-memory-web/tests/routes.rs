@@ -212,6 +212,49 @@ async fn smoke_search_returns_200() {
 }
 
 #[tokio::test]
+async fn web_links_percent_encode_route_segments() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch #1", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            proj,
+            "notes/a b%25.md",
+            "Encoded Link",
+            "route encoding check",
+        ))
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch%20%231")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("/web/w/default/scratch%20%231/p/notes/a%20b%2525.md"),
+        "expected encoded href in project response: {text}"
+    );
+}
+
+#[tokio::test]
 async fn smoke_page_not_found_returns_404() {
     let (_tmp, store, wiki) = setup().await;
     let _ws = store

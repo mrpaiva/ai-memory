@@ -171,7 +171,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let server_clone = server.clone();
-            // `Host`-header allowlist for rmcp's DNS-rebinding guard.
+            // `Host`-header allowlist for the HTTP DNS-rebinding guard.
             // Sourced from Config (which already handles the
             // `AI_MEMORY_ALLOWED_HOSTS=a,b,c` env-string vs.
             // config.toml sequence forms via the string-or-vec
@@ -179,7 +179,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // effective list against what they intended.
             info!(
                 allowed_hosts = ?config.allowed_hosts,
-                "MCP Host-header allowlist"
+                "HTTP Host-header allowlist"
             );
             // Default to stateless Streamable HTTP: each POST is serviced
             // independently and answered as plain `application/json`, so

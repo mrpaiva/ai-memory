@@ -6,7 +6,7 @@
 <nav class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
   <a href="/web/" class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
   <span>/</span>
-  <a href="/web/w/{{ workspace }}/{{ project }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
   <span>/</span>
   <span class="text-slate-700 dark:text-slate-200 truncate max-w-xs">{{ path }}</span>
 </nav>
@@ -32,7 +32,7 @@
     <span>Created {{ created_relative }}</span>
     {% if supersedes_path != "" %}
     <span>·</span>
-    <span>Supersedes <a href="/web/w/{{ workspace }}/{{ project }}/p/{{ supersedes_path }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
+    <span>Supersedes <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
     {% endif %}
   </div>
 
