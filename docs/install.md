@@ -256,9 +256,16 @@ cargo build --release --workspace
 ```
 
 Data dir defaults to `~/.local/share/ai-memory` on Linux,
-`~/Library/Application Support/ai-memory` on macOS. Override with
-`AI_MEMORY_DATA_DIR=/path`. To require bearer-token auth, set
-`AI_MEMORY_AUTH_TOKEN` in the server's environment.
+`~/Library/Application Support/ai-memory` on macOS, and the platform
+local-data directory on Windows, typically
+`%LOCALAPPDATA%\ai-memory`. Override with `AI_MEMORY_DATA_DIR=/path`.
+To require bearer-token auth, set `AI_MEMORY_AUTH_TOKEN` in the
+server's environment.
+
+On Windows, see [`docs/windows.md`](windows.md). The short version: run
+the install commands from the same environment that launches the agent.
+WSL2-launched agents need WSL paths and POSIX `.sh` hooks; native Windows
+agents need Windows paths and PowerShell `.ps1` hooks.
 
 When run from source, `install-hooks` finds the bundled scripts in
 the repo's `hooks/` automatically:

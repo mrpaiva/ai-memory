@@ -16,17 +16,18 @@
 //! client and is the part that makes the printout readable). What
 //! lives here is only the *data* both consume.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde_json::json;
 
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
-/// `(event-name-in-Claude-Code-settings, hook-script-filename)`.
+/// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
 /// Adding a hook event means updating this list AND adding the
-/// matching `hooks/{claude-code,codex,cursor,gemini-cli,opencode}/<filename>` script —
-/// the e2e test + the generator in `bin/regen-hooks` (if added) both
-/// key off this constant.
+/// matching `.sh` and `.ps1` files under
+/// `hooks/{claude-code,codex,cursor,gemini-cli,opencode}/`. The
+/// install-hooks parity test fails if the bundle drifts.
 pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
@@ -58,7 +59,7 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
 /// - `setup-agent --agent claude-code` (script paths are where
 ///   `--host-prefix` says they'll live on the host)
 ///
-/// `emit_root` is the directory that will contain `*.sh`; it is
+/// `emit_root` is the directory that will contain hook scripts; it is
 /// expected to be an absolute path on the system that will run the
 /// agent CLI. This function does NOT verify the path exists on the
 /// local filesystem — that decision belongs to the caller because
@@ -108,8 +109,9 @@ pub(crate) struct HookProfile {
     /// `(EventName, script_basename)` tuples in the order the
     /// agent surfaces them. Event names are case-sensitive and
     /// agent-specific — Claude Code uses `SessionStart` while
-    /// Cursor uses `sessionStart`. The script basename resolves
-    /// against `hooks/<agent-dir>/`.
+    /// Cursor uses `sessionStart`. The POSIX script filename resolves
+    /// against `hooks/<agent-dir>/`; Windows rendering rewrites the
+    /// `.sh` suffix to `.ps1`.
     pub events: &'static [(&'static str, &'static str)],
     /// JSON shape the file uses.
     pub shape: HookShape,
@@ -210,9 +212,47 @@ fn build_hook_payload(
     auth_token: Option<&str>,
     shape: HookShape,
 ) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        events,
+        emit_root,
+        server_url,
+        auth_token,
+        shape,
+        HookCommandPlatform::current(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookCommandPlatform {
+    Posix,
+    Windows,
+}
+
+impl HookCommandPlatform {
+    fn current() -> Self {
+        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
+            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
+            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
+                Self::Posix
+            }
+            _ if cfg!(windows) => Self::Windows,
+            _ => Self::Posix,
+        }
+    }
+}
+
+fn build_hook_payload_for_platform(
+    events: &[(&str, &str)],
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    shape: HookShape,
+    platform: HookCommandPlatform,
+) -> serde_json::Value {
     let mut hooks_block = serde_json::Map::new();
     for (event, script) in events {
-        let abs = emit_root.join(script);
+        let script = script_for_platform(script, platform);
+        let abs = emit_root.join(script.as_ref());
 
         // Claude Code's hook schema (per
         // https://code.claude.com/docs/en/hooks):
@@ -235,12 +275,9 @@ fn build_hook_payload(
         //      `VAR=val command` syntax is universally honoured.
         //   3. The hook scripts already read those env vars (see
         //      `hooks/claude-code/session-start.sh` etc.), so no
-        //      script changes are required.
-        let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
-        if let Some(t) = auth_token {
-            prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
-        }
-        let command = format!("{prefix}{}", abs.to_string_lossy());
+        //      script changes are required on POSIX. Windows uses an
+        //      explicit PowerShell command with equivalent env setup.
+        let command = hook_command(&abs, server_url, auth_token, platform);
 
         // Empty matcher = fire on every event of this kind. Right
         // for ai-memory's capture hooks (every prompt, every tool
@@ -264,6 +301,50 @@ fn build_hook_payload(
     json!({ "hooks": hooks_block })
 }
 
+fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, str> {
+    match platform {
+        HookCommandPlatform::Posix => Cow::Borrowed(script),
+        HookCommandPlatform::Windows => match script.strip_suffix(".sh") {
+            Some(stem) => Cow::Owned(format!("{stem}.ps1")),
+            None => Cow::Borrowed(script),
+        },
+    }
+}
+
+pub(crate) fn hook_script_for_current_platform(script: &str) -> Cow<'_, str> {
+    script_for_platform(script, HookCommandPlatform::current())
+}
+
+fn hook_command(
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+) -> String {
+    match platform {
+        HookCommandPlatform::Posix => {
+            let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+            if let Some(t) = auth_token {
+                prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+            }
+            format!("{prefix}{}", script.to_string_lossy())
+        }
+        HookCommandPlatform::Windows => {
+            let mut setup = format!("$env:AI_MEMORY_HOOK_URL={}", powershell_quote(server_url));
+            if let Some(t) = auth_token {
+                setup.push_str(&format!(
+                    "; $env:AI_MEMORY_AUTH_TOKEN={}",
+                    powershell_quote(t)
+                ));
+            }
+            format!(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{setup}; & {}\"",
+                powershell_quote(&script.to_string_lossy())
+            )
+        }
+    }
+}
+
 /// Minimal shell quoting for embedding values into a `VAR=val cmd`
 /// prefix. Wraps in single quotes; embedded `'` is escaped via
 /// `'\''`. Safe for the URLs and bearer tokens we embed (no
@@ -274,6 +355,10 @@ fn shell_quote(s: &str) -> String {
     }
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+fn powershell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -484,7 +569,9 @@ mod tests {
 
     #[test]
     fn claude_code_payload_emits_absolute_paths() {
-        let root = PathBuf::from("/home/user/.ai-memory/hooks/claude-code");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("hooks")
+            .join("claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let cmd = v
             .pointer("/hooks/SessionStart/0/hooks/0/command")
@@ -492,9 +579,38 @@ mod tests {
             .unwrap();
         // The command now has the env prefix + the absolute path,
         // joined by a single space.
+        let expected = root.join("session-start.sh").to_string_lossy().to_string();
         assert!(
-            cmd.ends_with("/home/user/.ai-memory/hooks/claude-code/session-start.sh"),
+            cmd.ends_with(&expected),
             "command should end with the absolute script path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn windows_payload_uses_powershell_and_ps1_hooks() {
+        let root = PathBuf::from("C:/Users/alice/.local/share/ai-memory/hooks/claude-code");
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookShape::Nested,
+            HookCommandPlatform::Windows,
+        );
+        let cmd = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(cmd.starts_with("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command"));
+        assert!(cmd.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"));
+        assert!(cmd.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"));
+        assert!(
+            cmd.contains("session-start.ps1"),
+            "expected ps1 script path: {cmd}"
+        );
+        assert!(
+            !cmd.contains("session-start.sh"),
+            "Windows command must not use sh: {cmd}"
         );
     }
 }

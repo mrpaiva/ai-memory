@@ -23,7 +23,7 @@ use crate::cli::{AgentChoice, InstallHooksArgs};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
 use crate::commands::render_shared::{
     CURSOR_PROFILE, GEMINI_PROFILE, build_claude_code_payload, build_codex_payload,
-    build_profile_payload,
+    build_profile_payload, hook_script_for_current_platform,
 };
 use crate::config::Config;
 
@@ -117,7 +117,8 @@ fn apply_to_claude_code_settings(
             .join("settings.json"),
     };
     let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
-    let payload = build_claude_code_payload(&staged, server_url, auth_token);
+    let command_dir = staged_command_dir(&staged, "claude-code");
+    let payload = build_claude_code_payload(&command_dir, server_url, auth_token);
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -190,7 +191,8 @@ fn apply_to_codex_settings(
             .join("hooks.json"),
     };
     let staged = stage_hook_scripts(hooks_dir, "codex")?;
-    let outcome = merge_codex_hooks(&staged, server_url, auth_token, &path)?;
+    let command_dir = staged_command_dir(&staged, "codex");
+    let outcome = merge_codex_hooks(&command_dir, server_url, auth_token, &path)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -284,7 +286,8 @@ fn apply_to_cursor_settings(
             .join("hooks.json"),
     };
     let staged = stage_hook_scripts(hooks_dir, "cursor")?;
-    let outcome = merge_cursor_hooks(&staged, server_url, auth_token, &path)?;
+    let command_dir = staged_command_dir(&staged, "cursor");
+    let outcome = merge_cursor_hooks(&command_dir, server_url, auth_token, &path)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -359,7 +362,8 @@ fn apply_to_gemini_settings(
             .join("settings.json"),
     };
     let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
-    let outcome = merge_gemini_hooks(&staged, server_url, auth_token, &path)?;
+    let command_dir = staged_command_dir(&staged, "gemini-cli");
+    let outcome = merge_gemini_hooks(&command_dir, server_url, auth_token, &path)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -939,7 +943,7 @@ fn render_agent(
     for entry in std::fs::read_dir(hooks_dir)? {
         let entry = entry?;
         let p = entry.path();
-        if p.is_file() && p.extension().is_some_and(|e| e == "sh") {
+        if p.is_file() && p.extension().is_some_and(|e| e == hook_script_extension()) {
             println!("- {}", p.display());
         }
     }
@@ -991,7 +995,7 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
     if let Ok(entries) = fs::read_dir(&dest_root) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "sh") {
+            if p.is_file() && is_hook_script_file(&p) {
                 fs::remove_file(&p).ok();
             }
         }
@@ -1003,7 +1007,7 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
     {
         let entry = entry?;
         let from = entry.path();
-        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some("sh") {
+        if !from.is_file() || !is_hook_script_file(&from) {
             continue;
         }
         let to = dest_root.join(from.file_name().context("bad source file name")?);
@@ -1021,8 +1025,61 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
         copied += 1;
     }
 
+    copy_support_hook_scripts(source_dir, &dest_root)?;
+
     eprintln!("✓ staged {copied} hook script(s) → {}", dest_root.display());
     Ok(dest_root)
+}
+
+fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> {
+    let Some(source_hooks_root) = source_dir.parent() else {
+        return Ok(());
+    };
+    let source_lib = source_hooks_root.join("lib");
+    if !source_lib.is_dir() {
+        return Ok(());
+    }
+    let Some(dest_hooks_root) = dest_root.parent() else {
+        return Ok(());
+    };
+    let dest_lib = dest_hooks_root.join("lib");
+    fs::create_dir_all(&dest_lib)
+        .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
+    for entry in fs::read_dir(&source_lib)
+        .with_context(|| format!("reading hook support dir {}", source_lib.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some("ps1") {
+            continue;
+        }
+        let to = dest_lib.join(from.file_name().context("bad support file name")?);
+        fs::copy(&from, &to)
+            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+fn staged_command_dir(staged: &Path, agent_label: &str) -> PathBuf {
+    match std::env::var("AI_MEMORY_HOOKS_HOST_ROOT") {
+        Ok(root) if !root.trim().is_empty() => PathBuf::from(root).join(agent_label),
+        _ => staged.to_path_buf(),
+    }
+}
+
+fn hook_script_extension() -> &'static str {
+    if hook_script_for_current_platform("x.sh").ends_with(".ps1") {
+        "ps1"
+    } else {
+        "sh"
+    }
+}
+
+fn is_hook_script_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("sh" | "ps1")
+    )
 }
 
 fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<PathBuf> {
@@ -1084,7 +1141,8 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
     // that exists only on the host's filesystem — bailing would
     // sabotage the docker-only flow `setup-agent` enables.
     for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
-        let abs = hooks_dir.join(script);
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
             eprintln!(
                 "# warning: {} not present on this filesystem. \
@@ -1102,7 +1160,7 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook's env block below.");
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
         println!("#       Treat ~/.claude/settings.json as sensitive (chmod 600).");
     }
     println!();
@@ -1113,6 +1171,7 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::process::Command;
@@ -1130,6 +1189,107 @@ mod tests {
                 fs::set_permissions(&p, perms).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn bundled_posix_and_powershell_hooks_stay_in_parity() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        assert!(
+            hooks_root.join("lib").join("ai-memory-hook.ps1").is_file(),
+            "PowerShell hooks require the shared lib helper"
+        );
+
+        for agent_dir in ["claude-code", "codex", "cursor", "gemini-cli", "opencode"] {
+            let dir = hooks_root.join(agent_dir);
+            let mut sh = BTreeMap::new();
+            let mut ps1 = BTreeMap::new();
+            for entry in fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("failed to read bundled hook dir {}: {e}", dir.display())
+            }) {
+                let path = entry.unwrap().path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                match path.extension().and_then(|s| s.to_str()) {
+                    Some("sh") => {
+                        sh.insert(stem.to_string(), extract_sh_hook_metadata(&path));
+                    }
+                    Some("ps1") => {
+                        ps1.insert(stem.to_string(), extract_ps1_hook_metadata(&path));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                sh.keys().collect::<Vec<_>>(),
+                ps1.keys().collect::<Vec<_>>(),
+                "{agent_dir}: every .sh hook must have a .ps1 peer"
+            );
+            for (stem, sh_meta) in sh {
+                assert_eq!(
+                    Some(sh_meta),
+                    ps1.remove(&stem),
+                    "{agent_dir}/{stem}: .sh and .ps1 must post the same event/agent"
+                );
+            }
+        }
+    }
+
+    fn extract_sh_hook_metadata(path: &Path) -> (String, String) {
+        let text = fs::read_to_string(path).unwrap();
+        let marker = "hook?event=";
+        let start = text
+            .find(marker)
+            .unwrap_or_else(|| panic!("{} missing hook endpoint", path.display()))
+            + marker.len();
+        let rest = &text[start..];
+        let event = rest
+            .split('&')
+            .next()
+            .unwrap_or_else(|| panic!("{} missing event", path.display()))
+            .to_string();
+        let agent_marker = "&agent=";
+        let agent_start = rest
+            .find(agent_marker)
+            .unwrap_or_else(|| panic!("{} missing agent", path.display()))
+            + agent_marker.len();
+        let agent = rest[agent_start..]
+            .split(['"', '\'', ' ', '\n', '\r'])
+            .next()
+            .unwrap_or_else(|| panic!("{} missing agent value", path.display()))
+            .to_string();
+        (event, agent)
+    }
+
+    fn extract_ps1_hook_metadata(path: &Path) -> (String, String) {
+        let text = fs::read_to_string(path).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("Invoke-AiMemoryHook"))
+            .unwrap_or_else(|| panic!("{} missing Invoke-AiMemoryHook", path.display()));
+        (
+            extract_ps1_arg(line, "Event", path),
+            extract_ps1_arg(line, "Agent", path),
+        )
+    }
+
+    fn extract_ps1_arg(line: &str, name: &str, path: &Path) -> String {
+        let marker = format!("-{name} \"");
+        let start = line
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{} missing {name} argument", path.display()))
+            + marker.len();
+        line[start..]
+            .split('"')
+            .next()
+            .unwrap_or_else(|| panic!("{} missing {name} value", path.display()))
+            .to_string()
     }
 
     // ----------------------------------------------------------------

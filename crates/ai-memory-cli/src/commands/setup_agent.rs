@@ -18,11 +18,11 @@
 //!         --host-prefix "$HOME/.ai-memory/hooks" \
 //!         --auth-token "$TOKEN"
 //!
-//! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.sh` into
+//! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.{sh,ps1}` into
 //!    `/host/hooks/claude-code/` (which on the host is
 //!    `$HOME/.ai-memory/hooks/claude-code/`).
 //! 2. Prints the JSON config snippet whose `command` fields point at
-//!    `$HOME/.ai-memory/hooks/claude-code/*.sh` (via `--host-prefix`)
+//!    `$HOME/.ai-memory/hooks/claude-code/*.{sh,ps1}` (via `--host-prefix`)
 //!    so Claude Code on the host can exec them.
 //!
 //! When `--host-prefix` is omitted it defaults to `--to`, which is
@@ -35,7 +35,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
-use crate::commands::render_shared::{CLAUDE_CODE_EVENTS, build_claude_code_payload};
+use crate::commands::render_shared::{
+    CLAUDE_CODE_EVENTS, build_claude_code_payload, hook_script_for_current_platform,
+};
 use crate::config::Config;
 
 /// Run the `setup-agent` subcommand.
@@ -82,7 +84,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     {
         let entry = entry?;
         let from = entry.path();
-        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some("sh") {
+        if !from.is_file() || !is_hook_script_file(&from) {
             continue;
         }
         let file_name = from
@@ -102,6 +104,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         }
         copied += 1;
     }
+
+    copy_support_hook_scripts(&source, &dest_dir)?;
 
     eprintln!(
         "✓ Extracted {copied} hook script(s) from {} to {}",
@@ -200,11 +204,51 @@ fn emit_other(emit_root: &Path, label: &str, args: &SetupAgentArgs) {
     }
     println!();
     for (_, script) in CLAUDE_CODE_EVENTS {
-        println!("- {}", emit_root.join(script).display());
+        let script = hook_script_for_current_platform(script);
+        println!("- {}", emit_root.join(script.as_ref()).display());
     }
     println!();
     println!("Set AI_MEMORY_HOOK_URL in each hook's environment to override the default.");
     println!("Also run `ai-memory install-mcp --client {label}` to wire MCP separately.");
+}
+
+fn is_hook_script_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("sh" | "ps1")
+    )
+}
+
+fn copy_support_hook_scripts(source_dir: &Path, dest_dir: &Path) -> Result<()> {
+    let Some(source_hooks_root) = source_dir.parent() else {
+        return Ok(());
+    };
+    let source_lib = source_hooks_root.join("lib");
+    if !source_lib.is_dir() {
+        return Ok(());
+    }
+    let Some(dest_hooks_root) = dest_dir.parent() else {
+        return Ok(());
+    };
+    let dest_lib = dest_hooks_root.join("lib");
+    fs::create_dir_all(&dest_lib)
+        .with_context(|| format!("creating hook support dir {}", dest_lib.display()))?;
+    for entry in fs::read_dir(&source_lib)
+        .with_context(|| format!("reading hook support dir {}", source_lib.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some("ps1") {
+            continue;
+        }
+        let to = dest_lib.join(
+            from.file_name()
+                .with_context(|| format!("invalid hook support path {}", from.display()))?,
+        );
+        fs::copy(&from, &to)
+            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    }
+    Ok(())
 }
 
 fn resolve_source(explicit: Option<&Path>, sub: &str) -> Result<PathBuf> {

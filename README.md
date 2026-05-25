@@ -137,9 +137,9 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
-That's it. Start a Claude Code session as usual - every prompt and
-tool call now lands in ai-memory, and the next session you open in
-this project will see a handoff with where you left off.
+On Linux/macOS, that's it. Start a Claude Code session as usual - every
+prompt and tool call now lands in ai-memory, and the next session you
+open in this project will see a handoff with where you left off.
 
 The `install-mcp` / `install-hooks` commands default to
 `http://127.0.0.1:49374` (matching the server above) and no bearer
@@ -150,6 +150,14 @@ write. The hook scripts are staged into
 `~/.local/share/ai-memory/hooks/<agent>/` automatically; re-running
 overwrites them so future image updates ship updated hooks. Drop
 `--apply` to print the snippet instead of mutating.
+
+### Windows Status
+
+Windows support has two separate modes. If your agent runs inside WSL2,
+use the Linux quick start inside WSL2. If your agent runs as a native
+Windows process, use the PowerShell wrapper and `.ps1` hooks. Do not mix
+the two path worlds. See [`docs/windows.md`](docs/windows.md) for the
+native Windows, WSL2, and current real-world testing notes.
 
 > **Prefer docker compose?** Clone the repo and run
 > `docker compose -f docker/docker-compose.yml up -d` instead of
@@ -704,6 +712,7 @@ data-flow diagram + crate breakdown + cross-cutting invariants.
 | File | What it is |
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
+| [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP config snippets (Cursor, Claude Desktop, Gemini CLI, OpenClaw, OMP). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, TLS via cloudflared. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset.** Safety matrix for the state-touching commands, per-project disk layout (how isolation actually works), and operator workflows for "fresh start", "snapshot before risky op", "drop one project". |
