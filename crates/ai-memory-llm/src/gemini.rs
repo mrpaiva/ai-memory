@@ -87,12 +87,20 @@ struct GeminiSystem<'a> {
 struct GeminiGenerationConfig {
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<&'static str>,
     #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
     response_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +197,7 @@ impl GeminiProvider {
             system_instruction,
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: request.max_tokens,
+                thinking_config: default_thinking_config_for(&self.model),
                 temperature: request.temperature,
                 response_mime_type,
                 response_schema,
@@ -236,6 +245,14 @@ impl GeminiProvider {
     }
 }
 
+fn default_thinking_config_for(model: &str) -> Option<GeminiThinkingConfig> {
+    let model = model.to_ascii_lowercase();
+    if model.contains("gemini-2.5-flash") {
+        return Some(GeminiThinkingConfig { thinking_budget: 0 });
+    }
+    None
+}
+
 fn first_text(response: &GeminiResponse) -> Option<String> {
     let candidate = response.candidates.first()?;
     let content = candidate.content.as_ref()?;
@@ -244,7 +261,11 @@ fn first_text(response: &GeminiResponse) -> Option<String> {
         .iter()
         .filter_map(|p| p.text.as_deref())
         .collect();
-    if joined.is_empty() { None } else { Some(joined) }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }
 
 /// Normalise a schemars-generated JSON Schema into the Gemini-supported
@@ -403,7 +424,10 @@ mod tests {
             .unwrap();
         assert_eq!(item.get("type").unwrap(), "object");
         assert!(!item.contains_key("additionalProperties"));
-        assert_eq!(item.get("properties").unwrap().get("path").unwrap(), &json!({"type": "string"}));
+        assert_eq!(
+            item.get("properties").unwrap().get("path").unwrap(),
+            &json!({"type": "string"})
+        );
     }
 
     #[test]
@@ -434,5 +458,26 @@ mod tests {
         });
         let prepared = prepare_schema_for_gemini(schema.clone()).unwrap();
         assert_eq!(prepared, schema);
+    }
+
+    #[test]
+    fn build_request_disables_default_thinking_for_25_flash() {
+        let provider =
+            GeminiProvider::new(SecretString::from("test-key"), "gemini-2.5-flash").unwrap();
+        let request = ChatRequest::user_prompt("emit json");
+        let body = serde_json::to_value(provider.build_request(&request, None)).unwrap();
+        assert_eq!(
+            body.pointer("/generationConfig/thinkingConfig/thinkingBudget"),
+            Some(&json!(0))
+        );
+    }
+
+    #[test]
+    fn build_request_omits_thinking_config_for_non_flash_models() {
+        let provider =
+            GeminiProvider::new(SecretString::from("test-key"), "gemini-2.5-pro").unwrap();
+        let request = ChatRequest::user_prompt("emit json");
+        let body = serde_json::to_value(provider.build_request(&request, None)).unwrap();
+        assert!(body.pointer("/generationConfig/thinkingConfig").is_none());
     }
 }

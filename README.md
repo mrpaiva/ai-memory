@@ -30,7 +30,7 @@
 | Oh My Pi / OMP | Supported | `pi` / `omp` aliases for MCP config + TypeScript extension. |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | MCP-only | OpenClaw has MCP/webhook ingress but no lifecycle hook surface. |
-| LLM providers | Supported | Anthropic, OpenAI, and OpenAI-compatible endpoints. |
+| LLM providers | Supported | Anthropic, OpenAI, Gemini, and OpenAI-compatible endpoints. |
 | Embedding providers | Supported | OpenAI and Voyage. |
 
 ## What it is

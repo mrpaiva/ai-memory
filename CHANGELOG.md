@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Experimental native Windows support: PowerShell Docker wrapper,
   `ai-memory.cmd`, `.ps1` lifecycle hooks in parity with `.sh` hooks, Windows
   Tailwind hash/download support, and [`docs/windows.md`](docs/windows.md).
+- Google Gemini LLM provider via `AI_MEMORY_LLM_PROVIDER=gemini`, with
+  `gemini-2.5-flash` as the default hosted Google model and `GEMINI_API_KEY`
+  / `GOOGLE_API_KEY` support.
 - README support matrix for operating systems, agent integrations, LLM
   providers, and embedding providers.
 
@@ -33,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Hyphenated FTS5 queries such as `ai-memory` are normalized safely instead of
   being parsed as column operators.
+- Gemini 2.5 Flash requests disable default dynamic thinking so hidden thought
+  tokens do not consume `maxOutputTokens` and truncate strict JSON responses.
 
 ## [0.1.3] - 2026-05-24
 
