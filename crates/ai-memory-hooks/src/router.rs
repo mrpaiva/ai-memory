@@ -242,6 +242,24 @@ fn render_handoff_markdown(h: &Handoff) -> String {
     buf
 }
 
+/// Build the `project_cache` key from the resolved cwd, overrides, and
+/// project strategy. Shared by `resolve_project_ids` (insert/lookup) and
+/// `process` (eviction on the stale-cache retry) so the two always agree on
+/// the slot.
+fn cache_key_for(
+    cwd_norm: Option<&str>,
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
+    project_strategy: ProjectStrategy,
+) -> (String, String, String, String) {
+    (
+        cwd_norm.unwrap_or_default().to_string(),
+        workspace_override.unwrap_or_default().to_string(),
+        project_override.unwrap_or_default().to_string(),
+        project_strategy.as_str().to_string(),
+    )
+}
+
 /// Resolve the `(workspace_id, project_id)` pair for a hook event.
 ///
 /// Precedence:
@@ -251,9 +269,10 @@ fn render_handoff_markdown(h: &Handoff) -> String {
 ///    `basename(cwd)` OR fallback to `state.project_id` (when `cwd` is
 ///    also unavailable).
 ///
-/// Cache key is `(cwd, workspace_override, project_override, project_strategy)` so the
-/// same `cwd` resolved with and without an override (e.g. during a
-/// hook-script upgrade window) doesn't poison each other's slot.
+/// Cache key is `(cwd, workspace_override, project_override,
+/// project_strategy)` so the same `cwd` resolved with and without an
+/// override (e.g. during a hook-script upgrade window) doesn't poison each
+/// other's slot.
 async fn resolve_project_ids(
     state: &HookState,
     cwd: Option<&str>,
@@ -269,11 +288,11 @@ async fn resolve_project_ids(
         return Ok((state.workspace_id, state.project_id));
     }
 
-    let cache_key = (
-        cwd_norm.clone().unwrap_or_default(),
-        workspace_override.unwrap_or("").to_string(),
-        project_override.unwrap_or("").to_string(),
-        project_strategy.as_str().to_string(),
+    let cache_key = cache_key_for(
+        cwd_norm.as_deref(),
+        workspace_override,
+        project_override,
+        project_strategy,
     );
 
     {
@@ -361,7 +380,7 @@ async fn process_envelope(state: Arc<HookState>, env: HookEnvelope) {
 
 async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
-    let (ws, proj) = resolve_project_ids(
+    let (mut ws, mut proj) = resolve_project_ids(
         state,
         env.cwd.as_deref(),
         env.workspace_override.as_deref(),
@@ -381,7 +400,42 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
         agent_kind: env.agent,
         cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
     };
-    state.writer.begin_session(new_session).await?;
+    if let Err(e) = state.writer.begin_session(new_session).await {
+        // The cached (workspace, project) may have been deleted out from
+        // under us — e.g. `purge-project` on a live server drops the row
+        // but leaves this in-memory cache pointing at the old id, so
+        // begin_session trips the project foreign key. Evict the stale
+        // slot, re-resolve (which recreates the project), and retry once.
+        warn!(error = %e, "begin_session failed; evicting stale project cache and retrying");
+        let cwd_norm = env.cwd.as_deref().filter(|s| !s.is_empty());
+        let key = cache_key_for(
+            cwd_norm,
+            env.workspace_override.as_deref(),
+            env.project_override.as_deref(),
+            env.project_strategy,
+        );
+        state.project_cache.lock().await.remove(&key);
+        let refreshed = resolve_project_ids(
+            state,
+            env.cwd.as_deref(),
+            env.workspace_override.as_deref(),
+            env.project_override.as_deref(),
+            env.project_strategy,
+        )
+        .await?;
+        ws = refreshed.0;
+        proj = refreshed.1;
+        state
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: env.agent,
+                cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
+            })
+            .await?;
+    }
 
     // Persist the observation row.
     let kind = env.event.to_observation_kind();
@@ -864,6 +918,131 @@ mod tests {
             let cache = state.project_cache.lock().await;
             assert_eq!(cache.len(), 1, "no duplicate cache entries");
         }
+    }
+
+    /// If the cached project is deleted out from under the router (e.g.
+    /// `purge-project` on a live server), the next event must self-heal:
+    /// evict the stale slot, recreate the project, and ingest — instead of
+    /// failing forever on the `sessions.project_id` foreign key.
+    #[tokio::test]
+    async fn process_self_heals_when_cached_project_purged() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/user/heal-project";
+
+        // 1) First event creates + caches the project (and a session).
+        let env1 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "heal-sess-1" }),
+        );
+        process(&state, env1).await.unwrap();
+        let (ws, proj) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+
+        // 2) Purge the project — the DB row is gone but the cache still
+        //    points at it (exactly the purge-on-live-server scenario).
+        state
+            .writer
+            .purge_project(ws, proj, "default/heal-project")
+            .await
+            .unwrap();
+        assert!(
+            state
+                .project_cache
+                .lock()
+                .await
+                .values()
+                .any(|ids| *ids == (ws, proj)),
+            "cache still holds the now-deleted project id"
+        );
+
+        // 3) Next event with the same cwd must NOT error on the stale FK —
+        //    the router evicts, recreates, and ingests.
+        let env2 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "heal-sess-2" }),
+        );
+        process(&state, env2)
+            .await
+            .expect("self-heal: stale cached project must be recreated, not FK-fail");
+
+        // 4) The project was recreated (fresh id) and the event landed.
+        let (_, proj_new) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        assert_ne!(
+            proj_new, proj,
+            "purged project must be replaced by a fresh one"
+        );
+        let counts = state.reader.status_counts().await.unwrap();
+        assert!(counts.sessions >= 1, "recreated session must be persisted");
+    }
+
+    #[tokio::test]
+    async fn process_self_heal_evicts_project_strategy_cache_slot() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let repo_dir = tmp.path().join("repo-root-project");
+        init_repo_with_commit(&repo_dir);
+        let app_dir = repo_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let cwd = app_dir.to_str().unwrap();
+
+        let env1 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                project_strategy: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "heal-repo-root-1" }),
+        );
+        process(&state, env1).await.unwrap();
+        let (ws, proj) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
+
+        state
+            .writer
+            .purge_project(ws, proj, "default/repo-root-project")
+            .await
+            .unwrap();
+
+        let env2 = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some(cwd.into()),
+                project_strategy: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionID": "heal-repo-root-2" }),
+        );
+        process(&state, env2)
+            .await
+            .expect("repo-root cache slot must be evicted and recreated");
+
+        let (_, proj_new) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
+        assert_ne!(proj_new, proj);
     }
 
     /// A hook event fires end-to-end through `process`. Validates that

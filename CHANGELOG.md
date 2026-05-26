@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens do not consume `maxOutputTokens` and truncate strict JSON responses.
 - `install-mcp --client claude-code` now prints the direct-edit JSON path as
   `~/.claude.json`, matching the `--apply` path and `claude mcp add` behavior.
+- Hook routing now evicts a stale project-cache entry and retries once when a
+  live server sees a cached project deleted underneath it, such as after
+  `purge-project`, so capture resumes without restarting the server.
 
 ### Added
 - `ai-memory uninstall` — removes ai-memory's hooks, MCP registration, and
