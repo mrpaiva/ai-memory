@@ -132,6 +132,7 @@ dependencies = [
  "ai-memory-wiki",
  "anyhow",
  "axum",
+ "git2",
  "jiff",
  "regex",
  "serde",
