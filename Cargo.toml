@@ -89,6 +89,9 @@ notify = "8"
 notify-debouncer-full = "0.6"
 sysinfo = "0.32"
 
+# Windows NTFS file-index (inode equivalent) for own-write detection.
+winapi-util = "0.1"
+
 # MCP server SDK.
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
